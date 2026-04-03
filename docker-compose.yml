@@ -1,19 +1,90 @@
 services:
-  app:
-    build: .
+
+  # ── API Gateway ───────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
     ports:
-      - "8080:8080"
-    environment:
-      - ES_PASSWORD=${ES_PASSWORD}
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
+      - auth
+      - post
+      - social
+      - message
+
+  # ── Microservices ─────────────────────────────────────────────────────────
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - ES_URL=http://elasticsearch:9200
+      - ES_PASSWORD=${ES_PASSWORD}
+      - LOGSTASH_ADDRESS=logstash:5000
+    depends_on:
+      - elasticsearch
+      - logstash
+
+  post:
+    build:
+      context: .
+      dockerfile: services/post/Dockerfile
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - ES_URL=http://elasticsearch:9200
+      - ES_PASSWORD=${ES_PASSWORD}
+      - LOGSTASH_ADDRESS=logstash:5000
+    depends_on:
+      - elasticsearch
       - redis
       - logstash
-  
+
+  social:
+    build:
+      context: .
+      dockerfile: services/social/Dockerfile
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - ES_URL=http://elasticsearch:9200
+      - ES_PASSWORD=${ES_PASSWORD}
+      - LOGSTASH_ADDRESS=logstash:5000
+    depends_on:
+      - elasticsearch
+      - logstash
+
+  message:
+    build:
+      context: .
+      dockerfile: services/message/Dockerfile
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - ES_URL=http://elasticsearch:9200
+      - ES_PASSWORD=${ES_PASSWORD}
+      - LOGSTASH_ADDRESS=logstash:5000
+    depends_on:
+      - elasticsearch
+      - logstash
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.13.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-  
+
+  # ── Observability ─────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
     ports:
@@ -21,8 +92,11 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     depends_on:
-      - app
-  
+      - auth
+      - post
+      - social
+      - message
+
   grafana:
     image: grafana/grafana:latest
     ports:
@@ -32,6 +106,7 @@ services:
     depends_on:
       - prometheus
 
+  # ── Log Pipeline (ELK) ────────────────────────────────────────────────────
   elasticsearch-logs:
     image: elasticsearch:8.13.0
     environment:
@@ -40,7 +115,7 @@ services:
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
       - "9201:9200"
-  
+
   logstash:
     image: logstash:8.13.0
     ports:
@@ -49,7 +124,7 @@ services:
       - ./logstash/pipeline:/usr/share/logstash/pipeline
     depends_on:
       - elasticsearch-logs
-  
+
   kibana:
     image: kibana:8.13.0
     ports:
@@ -58,3 +133,6 @@ services:
       - ELASTICSEARCH_HOSTS=http://elasticsearch-logs:9200
     depends_on:
       - elasticsearch-logs
+
+volumes:
+  es_data:

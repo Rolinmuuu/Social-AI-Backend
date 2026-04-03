@@ -2,6 +2,18 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
-  - job_name: 'socialai'
+  - job_name: 'auth-service'
     static_configs:
-      - targets: ['app:8080']
+      - targets: ['auth:8081']
+
+  - job_name: 'post-service'
+    static_configs:
+      - targets: ['post:8082']
+
+  - job_name: 'social-service'
+    static_configs:
+      - targets: ['social:8083']
+
+  - job_name: 'message-service'
+    static_configs:
+      - targets: ['message:8084']
