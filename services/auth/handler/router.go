@@ -28,6 +28,7 @@ func InitRouter(esBackend sharedBackend.ElasticsearchBackendInterface) http.Hand
 		w.Write([]byte(`{"status":"ok"}`))
 	})).Methods("GET")
 
+	router.Use(middleware.RateLimitMiddleware)
 	router.Use(middleware.MetricsMiddleware)
 	router.Use(middleware.LoggingMiddleware)
 

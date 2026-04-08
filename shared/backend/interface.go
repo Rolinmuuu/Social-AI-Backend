@@ -10,6 +10,7 @@ import (
 
 type ElasticsearchBackendInterface interface {
 	ReadFromES(query elastic.Query, index string) (*elastic.SearchResult, error)
+	ReadFromESWithSize(query elastic.Query, index string, size int) (*elastic.SearchResult, error)
 	SaveToES(i interface{}, index string, id string) error
 	DeleteFromES(index string, id string) (bool, error)
 	IncrementFieldInES(index string, id string, field string, value int) error
@@ -19,6 +20,7 @@ type ElasticsearchBackendInterface interface {
 type GoogleCloudStorageBackendInterface interface {
 	SaveToGCS(r io.Reader, objectName string) (string, error)
 	DeleteFromGCS(objectName string) error
+	GenerateSignedURL(objectName string) (string, error)
 }
 
 // RedisBackendInterface mirrors the go-redis client signature with context.

@@ -27,7 +27,7 @@ func (p *KafkaProducer) getWriter(topic string) *kafka.Writer {
 	if writer, ok := p.writers[topic]; ok {
 		return writer
 	}
-	writer = &kafka.Writer{
+	writer := &kafka.Writer{
 		Addr: kafka.TCP(p.brokers...),
 		Topic:   topic,
 		Balancer: &kafka.LeastBytes{},

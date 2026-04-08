@@ -12,7 +12,8 @@ const (
 	SHARE_INDEX   = "share"
 	COMMENT_INDEX = "comment"
 	FOLLOW_INDEX  = "follow"
-	MESSAGE_INDEX = "message"
+	MESSAGE_INDEX      = "message"
+	NOTIFICATION_INDEX = "notification"
 
 	REDIS_ADDRESS  = "redis:6379"
 	REDIS_PASSWORD = ""

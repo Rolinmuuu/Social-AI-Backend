@@ -37,7 +37,7 @@ func (w *FeedWorker) HandlePostCreated(key string, value []byte) error {
 
 	// 查询发帖者的所有粉丝（follow 索引中 followee_id == event.UserId）
 	query := elastic.NewTermQuery("followee_id", event.UserId)
-	result, err := w.es.ReadFromES(query, constants.FOLLOW_INDEX)
+	result, err := w.es.ReadFromESWithSize(query, constants.FOLLOW_INDEX, 10000)
 	if err != nil {
 		return fmt.Errorf("fetch followers for user %s: %w", event.UserId, err)
 	}

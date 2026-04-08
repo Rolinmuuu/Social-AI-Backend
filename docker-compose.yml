@@ -170,5 +170,19 @@ services:
       - ES_PASSWORD=${ES_PASSWORD}
       - LOGSTASH_ADDRESS=logstash:5000
 
+  notification-worker:
+    build:
+      context: .
+      dockerfile: services/notification/Dockerfile
+    depends_on:
+      - kafka
+      - elasticsearch
+      - logstash
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - ES_URL=http://elasticsearch:9200
+      - ES_PASSWORD=${ES_PASSWORD}
+      - LOGSTASH_ADDRESS=logstash:5000
+
 volumes:
   es_data:

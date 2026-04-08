@@ -94,6 +94,16 @@ func InitElasticsearchBackend() (ElasticsearchBackendInterface, error) {
 				"deleted":           { "type": "boolean" },
 				"deleted_at":        { "type": "long" }
 			}}}`,
+		constants.NOTIFICATION_INDEX: `{
+			"mappings": { "properties": {
+				"notification_id": { "type": "keyword" },
+				"user_id":         { "type": "keyword" },
+				"type":            { "type": "keyword" },
+				"actor_id":        { "type": "keyword" },
+				"post_id":         { "type": "keyword" },
+				"read":            { "type": "boolean" },
+				"created_at":      { "type": "long" }
+			}}}`,
 	}
 
 	ctx := context.Background()
@@ -117,6 +127,15 @@ func (b *ElasticsearchBackend) ReadFromES(query elastic.Query, index string) (*e
 	return b.client.Search().
 		Index(index).
 		Query(query).
+		Pretty(true).
+		Do(context.Background())
+}
+
+func (b *ElasticsearchBackend) ReadFromESWithSize(query elastic.Query, index string, size int) (*elastic.SearchResult, error) {
+	return b.client.Search().
+		Index(index).
+		Query(query).
+		Size(size).
 		Pretty(true).
 		Do(context.Background())
 }

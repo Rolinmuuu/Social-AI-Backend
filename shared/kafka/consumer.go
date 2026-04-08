@@ -2,43 +2,58 @@ package kafka
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/segmentio/kafka-go"
 )
 
+const maxRetries = 3
+
 type MessageHandler func(key string, value []byte) error
 
 type KafkaConsumer struct {
-	readers *kafka.Reader
+	reader *kafka.Reader
 }
 
 func NewKafkaConsumer(brokers []string, topic, groupID string) *KafkaConsumer {
 	return &KafkaConsumer{
-		readers: kafka.NewReader(kafka.ReaderConfig{
-			Brokers: brokers,
-			Topic:   topic,
-			GroupID: groupID,
+		reader: kafka.NewReader(kafka.ReaderConfig{
+			Brokers:  brokers,
+			Topic:    topic,
+			GroupID:  groupID,
 			MinBytes: 1,
-			MaxBytes: 10e6, // 10MB
+			MaxBytes: 10e6,
 		}),
 	}
 }
 
-// Consume 阻塞循环，每条消息交给 handler 处理
-// handler 出错只记录日志，不停止消费（保证 at-least-once 处理）
+// Consume blocks and processes messages. If a handler fails after maxRetries
+// attempts the message is committed and skipped to prevent poison-message loops.
 func (c *KafkaConsumer) Consume(ctx context.Context, handler MessageHandler) error {
 	for {
-		msg, err := c.readers.FetchMessage(ctx)
+		msg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
 			return err
 		}
-		if err := handler(msg.Key, msg.Value); err != nil {
-			continue
+
+		var lastErr error
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			if lastErr = handler(msg.Key, msg.Value); lastErr == nil {
+				break
+			}
+			fmt.Printf("handler error (attempt %d/%d) topic=%s offset=%d: %v\n",
+				attempt, maxRetries, msg.Topic, msg.Offset, lastErr)
 		}
-		_ = c.readers.CommitMessages(ctx, msg)
+
+		if lastErr != nil {
+			fmt.Printf("SKIP poison message after %d retries: topic=%s offset=%d key=%s\n",
+				maxRetries, msg.Topic, msg.Offset, string(msg.Key))
+		}
+
+		_ = c.reader.CommitMessages(ctx, msg)
 	}
 }
 
 func (c *KafkaConsumer) Close() error {
-	return c.readers.Close()
+	return c.reader.Close()
 }

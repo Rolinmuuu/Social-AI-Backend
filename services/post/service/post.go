@@ -31,7 +31,7 @@ func NewPostService(
 	redis backend.RedisBackendInterface,
 	gcs backend.GoogleCloudStorageBackendInterface,
 	openai backend.OpenAIBackendInterface,
-	kafka kafka.KafkaProducerInterface
+	kafka kafka.KafkaProducerInterface,
 ) *PostService {
 	return &PostService{es: es, redis: redis, gcs: gcs, openai: openai, kafka: kafka}
 }
@@ -110,6 +110,14 @@ func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
 	post.CleanupStatus = ""
 	post.RetryCount = 0
 	post.LastError = ""
+
+	if post.Message != "" && s.openai != nil {
+		if emb, err := s.openai.GetEmbedding(context.Background(), post.Message); err == nil {
+			post.Embedding = emb
+		} else {
+			fmt.Printf("WARNING: embedding generation failed for post %s: %v\n", post.PostId, err)
+		}
+	}
 
 	if err := s.es.SaveToES(post, constants.POST_INDEX, post.PostId); err != nil {
 		// Compensating transaction: remove the orphan GCS file.

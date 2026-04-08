@@ -69,3 +69,13 @@ type Message struct {
 	Content    string    `json:"content"`
 	CreatedAt  time.Time `json:"created_at"`
 }
+
+type Notification struct {
+	NotificationId string `json:"notification_id"`
+	UserId         string `json:"user_id"`
+	Type           string `json:"type"`
+	ActorId        string `json:"actor_id"`
+	PostId         string `json:"post_id"`
+	Read           bool   `json:"read"`
+	CreatedAt      int64  `json:"created_at"`
+}
