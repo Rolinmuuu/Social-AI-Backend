@@ -1,5 +1,4 @@
 services:
-
   # ── API Gateway ───────────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
@@ -36,10 +35,14 @@ services:
       - ES_URL=http://elasticsearch:9200
       - ES_PASSWORD=${ES_PASSWORD}
       - LOGSTASH_ADDRESS=logstash:5000
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - KAFKA_BROKERS=kafka:9092
     depends_on:
       - elasticsearch
       - redis
       - logstash
+      - openai
+      - kafka
 
   social:
     build:
@@ -133,6 +136,39 @@ services:
       - ELASTICSEARCH_HOSTS=http://elasticsearch-logs:9200
     depends_on:
       - elasticsearch-logs
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.0
+    environment:
+      - ZOOKEEPER_CLIENT_PORT=2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_ADVERTISED_LISTENERS:PLAINTEXT_HOST://kafka:9092
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+
+  feed-worker:
+    build:
+      context: .
+      dockerfile: services/feed/Dockerfile
+    depends_on:
+      - kafka
+      - redis
+      - elasticsearch
+      - logstash
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - ES_URL=http://elasticsearch:9200
+      - ES_PASSWORD=${ES_PASSWORD}
+      - LOGSTASH_ADDRESS=logstash:5000
 
 volumes:
   es_data:

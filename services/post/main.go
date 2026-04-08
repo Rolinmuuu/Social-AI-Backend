@@ -11,6 +11,7 @@ import (
 	sharedBackend "socialai/shared/backend"
 	"socialai/shared/constants"
 	"socialai/shared/logger"
+	"socialai/shared/kafka"
 
 	"go.uber.org/zap"
 )
@@ -39,8 +40,15 @@ func main() {
 		log.Fatalf("Failed to initialize GCS: %v", err)
 	}
 
-	// Single PostService instance shared by the HTTP handlers and the cleanup goroutine.
-	postSvc := service.NewPostService(esBackend, redisBackend, gcsBackend)
+	openaiBackend, err := sharedBackend.InitOpenAIBackend()
+	if err != nil {
+		log.Fatalf("Failed to initialize OpenAI: %v", err)
+	}
+
+	kafkaProducer := kafka.NewKafkaProducer(constants.KAFKA_BROKERS)
+	defer kafkaProducer.Close()
+
+	postSvc := service.NewPostService(esBackend, redisBackend, gcsBackend, openaiBackend, kafkaProducer)
 
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)

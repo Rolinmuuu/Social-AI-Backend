@@ -1,6 +1,9 @@
 package constants
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 const (
 	USER_INDEX    = "user"
@@ -23,6 +26,10 @@ var (
 	ES_URL      = getEnvOrDefault("ES_URL", "http://elasticsearch:9200")
 	ES_USERNAME = getEnvOrDefault("ES_USERNAME", "elastic")
 	ES_PASSWORD = os.Getenv("ES_PASSWORD")
+
+	KAFKA_BROKERS = strings.Split(getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"), ",")
+
+	OPENAI_API_KEY = os.Getenv("OPENAI_API_KEY")
 )
 
 func getEnvOrDefault(key, defaultVal string) string {

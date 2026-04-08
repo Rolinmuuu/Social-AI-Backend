@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"socialai/shared/constants"
@@ -39,7 +40,8 @@ func InitElasticsearchBackend() (ElasticsearchBackendInterface, error) {
 				"retry_count":   { "type": "integer" },
 				"last_error":    { "type": "text" },
 				"like_count":    { "type": "integer" },
-				"shared_count":  { "type": "integer" }
+				"shared_count":  { "type": "integer" },
+				"embedding":     { "type": "dense_vector", "dims": 1536, "index": true, "similarity": "cosine" }
 			}}}`,
 		constants.USER_INDEX: `{
 			"mappings": { "properties": {
@@ -155,4 +157,27 @@ func (b *ElasticsearchBackend) IncrementFieldInES(index, id, field string, value
 		return fmt.Errorf("increment failed: result=%s", result.Result)
 	}
 	return nil
+}
+
+func (b *ElasticsearchBackend) KNNSearchFromES(index, field string, vector []float32, k int) (*elastic.SearchResult, error) {
+	query := map[string]interface{}{
+		"knnQuery": map[string]interface{}{
+			"field": field,
+			"vector": vector,
+			"k": k,
+			"num_candidates": k * 2,
+		},
+	}
+	jsonQuery, err := json.Marshal(query)
+	if err != nil {
+		return nil, err
+	}
+	searchResult, err := b.client.Search().
+		Index(index).
+		Source(string(jsonQuery)).
+		Do(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return searchResult, nil
 }

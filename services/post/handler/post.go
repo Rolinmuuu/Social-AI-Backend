@@ -79,11 +79,14 @@ func (h *PostHandler) searchPostHandler(w http.ResponseWriter, r *http.Request) 
 
 	userId := r.URL.Query().Get("user_id")
 	keywords := r.URL.Query().Get("keywords")
+	mode := r.URL.Query().Get("mode")
 
 	var posts []model.Post
 	var err error
 	if userId != "" {
 		posts, err = h.postSvc.SearchPostByUserId(userId)
+	} else if mode == "semantic" && keywords != "" {
+		posts, err = h.postSvc.SemanticSearch(r.Context(), keywords, 20)
 	} else {
 		posts, err = h.postSvc.SearchPostByKeywords(keywords)
 	}
@@ -223,4 +226,30 @@ func (h *PostHandler) addCommentToPostHandler(w http.ResponseWriter, r *http.Req
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"comment_id": commentId})
+}
+
+func (h *PostHandler) generateImageFromOpenAIHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	token := r.Context().Value("user")
+	claims := token.(*jwt.Token).Claims.(jwt.MapClaims)
+	userId := claims["user_id"].(string)
+
+	var req struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+
+	post, err := h.postSvc.GenerateImageFromOpenAIAndSavePost(r.Context(), userId, req.Prompt)
+	if err != nil {
+		http.Error(w, `{"error":"failed to generate image"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(post)
 }

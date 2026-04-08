@@ -13,6 +13,7 @@ type ElasticsearchBackendInterface interface {
 	SaveToES(i interface{}, index string, id string) error
 	DeleteFromES(index string, id string) (bool, error)
 	IncrementFieldInES(index string, id string, field string, value int) error
+	KNNSearchFromES(index string, field string, vector []float32, k int) (*elastic.SearchResult, error)
 }
 
 type GoogleCloudStorageBackendInterface interface {
@@ -27,4 +28,9 @@ type RedisBackendInterface interface {
 	Delete(ctx context.Context, key ...string) error
 	SAdd(ctx context.Context, key string, members ...interface{}) error
 	SIsMember(ctx context.Context, key string, member interface{}) (bool, error)
+	// List operations used by feed fan-out worker
+	LPush(ctx context.Context, key string, values ...interface{}) error
+	LRange(ctx context.Context, key string, start, stop int64) ([]string, error)
+	LTrim(ctx context.Context, key string, start, stop int64) error
+	Expire(ctx context.Context, key string, expiration time.Duration) error
 }

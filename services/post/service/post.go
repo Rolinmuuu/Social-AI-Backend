@@ -9,6 +9,7 @@ import (
 
 	"socialai/shared/backend"
 	"socialai/shared/constants"
+	"socialai/shared/kafka"
 	"socialai/shared/model"
 	"socialai/shared/utils"
 
@@ -21,14 +22,18 @@ type PostService struct {
 	es    backend.ElasticsearchBackendInterface
 	redis backend.RedisBackendInterface
 	gcs   backend.GoogleCloudStorageBackendInterface
+	openai backend.OpenAIBackendInterface
+	kafka kafka.KafkaProducerInterface
 }
 
 func NewPostService(
 	es backend.ElasticsearchBackendInterface,
 	redis backend.RedisBackendInterface,
 	gcs backend.GoogleCloudStorageBackendInterface,
+	openai backend.OpenAIBackendInterface,
+	kafka kafka.KafkaProducerInterface
 ) *PostService {
-	return &PostService{es: es, redis: redis, gcs: gcs}
+	return &PostService{es: es, redis: redis, gcs: gcs, openai: openai, kafka: kafka}
 }
 
 func (s *PostService) SearchPostByUserId(userId string) ([]model.Post, error) {
@@ -76,6 +81,19 @@ func (s *PostService) SearchPostByKeywords(keywords string) ([]model.Post, error
 	return getPostFromSearchResult(searchResult), nil
 }
 
+func (s *PostService) SemanticSearch(ctx context.Context, queryText string, topK int) ([]model.Post, error) {
+	queryVector, err := s.openai.GetEmbedding(ctx, queryText)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate query embedding: %w", err)
+	}
+
+	searchResult, err := s.es.KNNSearchFromES(constants.POST_INDEX, "embedding", queryVector, topK)
+	if err != nil {
+		return nil, err
+	}
+	return getPostFromSearchResult(searchResult), nil
+}
+
 // SavePost persists a new post via Saga: GCS → ES → invalidate cache.
 // If ES save fails, the GCS file is deleted as compensation.
 func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
@@ -104,6 +122,19 @@ func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
 
 	ctx := context.Background()
 	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(post.UserId))
+
+	// Publish event to Kafka
+	event := model.PostCreatedEvent{
+		PostId: post.PostId,
+		UserId: post.UserId,
+		Message: post.Message,
+		Url: post.Url,
+		Type: post.Type,
+		CreatedAt: time.Now().Unix(),
+	}
+	if err := s.kafka.Publish(ctx, "post.created", post.PostId, event); err != nil {
+		return fmt.Errorf("WARN: failed to publish event to Kafka: %w", err)
+	}
 	return nil
 }
 
@@ -190,6 +221,17 @@ func (s *PostService) LikePost(postId, userId string) (bool, error) {
 		return false, err
 	}
 	_ = s.redis.SAdd(ctx, likeSetKey, userId)
+
+	// Publish event to Kafka
+	event := model.PostLikedEvent{
+		PostId: postId,
+		LikerId: userId,
+		OwnerId: post.UserId,
+		CreatedAt: time.Now().Unix(),
+	}
+	if err := s.kafka.Publish(ctx, "post.liked", postId, event); err != nil {
+		return false, fmt.Errorf("WARN: failed to publish event to Kafka: %w", err)
+	}
 	return true, nil
 }
 
@@ -326,4 +368,44 @@ func (s *PostService) AddComment(postId, parentCommentId, userId, content string
 		return "", err
 	}
 	return commentId, nil
+}
+
+func (s *PostService) GenerateImageFromOpenAIAndSavePost(ctx context.Context, userId, prompt string) (*model.Post, error) {
+	imageUrl, err := s.openai.GenerateImage(ctx, prompt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate image: %w", err)
+	}
+
+	body, err := backend.DownloadImage(imageUrl)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download image: %w", err)
+	}
+	defer body.Close()
+
+	post := &model.Post{
+		PostId:  uuid.New().String(),
+		UserId:  userId,
+		Message: prompt,
+		Type:    "image",
+	}
+
+	mediaLink, err := s.gcs.SaveToGCS(body, post.PostId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload image to GCS: %w", err)
+	}
+	post.Url = mediaLink
+
+	if embedding, err := s.openai.GetEmbedding(ctx, prompt); err == nil {
+		post.Embedding = embedding
+	} else {
+		fmt.Printf("WARNING: embedding generation failed, post saved without vector: %v\n", err)
+	}
+
+	if err := s.es.SaveToES(post, constants.POST_INDEX, post.PostId); err != nil {
+		_ = s.gcs.DeleteFromGCS(post.PostId)
+		return nil, fmt.Errorf("failed to save to ES: %w", err)
+	}
+
+	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(userId))
+	return post, nil
 }

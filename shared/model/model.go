@@ -14,8 +14,9 @@ type Post struct {
 	CleanupStatus string `json:"cleanup_status"`
 	RetryCount    int    `json:"retry_count"`
 	LastError     string `json:"last_error"`
-	LikeCount     int    `json:"like_count"`
-	SharedCount   int    `json:"shared_count"`
+	LikeCount     int       `json:"like_count"`
+	SharedCount   int       `json:"shared_count"`
+	Embedding     []float32 `json:"embedding,omitempty"`
 }
 
 type User struct {
