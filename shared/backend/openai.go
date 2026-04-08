@@ -50,8 +50,8 @@ func (b *OpenAIBackend) GenerateImage(ctx context.Context, prompt string) (strin
 // GetEmbedding call OpenAI API to get the embedding of the text
 // and return the embedding vector
 func (b *OpenAIBackend) GetEmbedding(ctx context.Context, text string) ([]float32, error) {
-	response, err := b.client.CreateEmbedding(ctx, openai.CreateEmbeddingRequest{
-		Model: openai.TextEmbedding3Small,
+	response, err := b.client.CreateEmbeddings(ctx, openai.EmbeddingRequestStrings{
+		Model: openai.SmallEmbedding3,
 		Input: []string{text},
 	})
 	if err != nil {

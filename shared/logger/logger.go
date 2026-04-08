@@ -8,7 +8,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-var Logger *zap.Logger
+var Logger = zap.NewNop()
 
 func InitLogger(logstashAddress string) {
 	encoderConfig := zap.NewProductionEncoderConfig()

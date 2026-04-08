@@ -13,9 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var testJWTSecret = []byte("test-secret-for-unit-tests")
+
 func newTestAuthRouter() http.Handler {
 	es := testutil.NewMockESBackend()
-	return InitRouter(es)
+	return InitRouter(es, testJWTSecret)
 }
 
 // ──────────────────── Contract: POST /signup ────────────────────
@@ -65,7 +67,7 @@ func TestSignup_Contract_400_InvalidUserId(t *testing.T) {
 func TestSignup_Contract_409_Duplicate(t *testing.T) {
 	es := testutil.NewMockESBackend()
 	es.SetDoc("user", "alice", map[string]string{"user_id": "alice"})
-	router := InitRouter(es)
+	router := InitRouter(es, testJWTSecret)
 
 	body, _ := json.Marshal(map[string]string{"user_id": "alice", "password": "pass123"})
 	req := httptest.NewRequest("POST", "/signup", bytes.NewReader(body))

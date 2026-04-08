@@ -2,7 +2,6 @@ package handler
 
 import (
 	"net/http"
-	"os"
 
 	"socialai/services/auth/service"
 	sharedBackend "socialai/shared/backend"
@@ -14,10 +13,7 @@ import (
 )
 
 // InitRouter wires up the auth service routes with dependency injection.
-// jwtSecret is read once from the environment and closed over in handlers.
-func InitRouter(esBackend sharedBackend.ElasticsearchBackendInterface) http.Handler {
-	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
-
+func InitRouter(esBackend sharedBackend.ElasticsearchBackendInterface, jwtSecret []byte) http.Handler {
 	userSvc := service.NewUserService(esBackend)
 	h := NewAuthHandler(userSvc, jwtSecret)
 

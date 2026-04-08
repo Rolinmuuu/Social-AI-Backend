@@ -3,6 +3,7 @@ package testutil
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -27,7 +28,14 @@ func NewMockRedisBackend() *MockRedisBackend {
 func (m *MockRedisBackend) Set(_ context.Context, key string, value interface{}, _ time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.store[key] = value.(string)
+	switch v := value.(type) {
+	case string:
+		m.store[key] = v
+	case []byte:
+		m.store[key] = string(v)
+	default:
+		m.store[key] = fmt.Sprintf("%v", v)
+	}
 	return nil
 }
 

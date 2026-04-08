@@ -23,7 +23,7 @@ func TestHandlePostLiked_CreatesNotification(t *testing.T) {
 	event := model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "bob", CreatedAt: 12345}
 	payload, _ := json.Marshal(event)
 
-	err := w.HandlePostLiked([]byte("p1"), payload)
+	err := w.HandlePostLiked("p1", payload)
 	require.NoError(t, err)
 	assert.Len(t, es.Docs["notification"], 1, "should create one notification")
 }
@@ -34,7 +34,7 @@ func TestHandlePostLiked_SelfLike_NoNotification(t *testing.T) {
 	event := model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "alice"}
 	payload, _ := json.Marshal(event)
 
-	err := w.HandlePostLiked([]byte("p1"), payload)
+	err := w.HandlePostLiked("p1", payload)
 	require.NoError(t, err)
 	assert.Empty(t, es.Docs["notification"], "self-like should not create notification")
 }
@@ -42,7 +42,7 @@ func TestHandlePostLiked_SelfLike_NoNotification(t *testing.T) {
 func TestHandlePostLiked_InvalidJSON(t *testing.T) {
 	w, _ := newTestNotificationWorker()
 
-	err := w.HandlePostLiked([]byte("key"), []byte("{invalid"))
+	err := w.HandlePostLiked("key", []byte("{invalid"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unmarshal")
 }
@@ -54,7 +54,7 @@ func TestHandlePostLiked_ESFails(t *testing.T) {
 	event := model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "bob"}
 	payload, _ := json.Marshal(event)
 
-	err := w.HandlePostLiked([]byte("p1"), payload)
+	err := w.HandlePostLiked("p1", payload)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "save notification")
 }

@@ -29,7 +29,7 @@ func TestHandlePostCreated_FanOutToFollowers(t *testing.T) {
 	}
 	payload, _ := json.Marshal(event)
 
-	err := w.HandlePostCreated([]byte("author1"), payload)
+	err := w.HandlePostCreated("author1", payload)
 	require.NoError(t, err)
 
 	feedA := redis.GetList("home_feed:follower_a")
@@ -44,7 +44,7 @@ func TestHandlePostCreated_NoFollowers(t *testing.T) {
 	event := model.PostCreatedEvent{PostId: "p1", UserId: "loner"}
 	payload, _ := json.Marshal(event)
 
-	err := w.HandlePostCreated([]byte("loner"), payload)
+	err := w.HandlePostCreated("loner", payload)
 	require.NoError(t, err)
 	assert.Empty(t, redis.GetList("home_feed:loner"))
 }
@@ -52,7 +52,7 @@ func TestHandlePostCreated_NoFollowers(t *testing.T) {
 func TestHandlePostCreated_InvalidJSON(t *testing.T) {
 	w, _, _ := newTestFeedWorker()
 
-	err := w.HandlePostCreated([]byte("key"), []byte("not-json"))
+	err := w.HandlePostCreated("key", []byte("not-json"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unmarshal")
 }

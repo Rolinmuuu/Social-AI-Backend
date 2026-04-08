@@ -17,7 +17,8 @@ func main() {
 	logger.InitLogger(constants.LOGSTASH_ADDRESS)
 	defer logger.Logger.Sync()
 
-	if os.Getenv("JWT_SECRET") == "" {
+	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
+	if len(jwtSecret) == 0 {
 		log.Fatal("JWT_SECRET environment variable is required")
 	}
 
@@ -28,7 +29,7 @@ func main() {
 
 	addr := ":8081"
 	logger.Logger.Info("auth-service starting", zap.String("addr", addr))
-	if err := http.ListenAndServe(addr, handler.InitRouter(esBackend)); err != nil {
+	if err := http.ListenAndServe(addr, handler.InitRouter(esBackend, jwtSecret)); err != nil {
 		logger.Logger.Fatal("auth-service stopped", zap.Error(err))
 	}
 }

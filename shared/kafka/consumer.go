@@ -38,7 +38,7 @@ func (c *KafkaConsumer) Consume(ctx context.Context, handler MessageHandler) err
 
 		var lastErr error
 		for attempt := 1; attempt <= maxRetries; attempt++ {
-			if lastErr = handler(msg.Key, msg.Value); lastErr == nil {
+			if lastErr = handler(string(msg.Key), msg.Value); lastErr == nil {
 				break
 			}
 			fmt.Printf("handler error (attempt %d/%d) topic=%s offset=%d: %v\n",
