@@ -6,12 +6,12 @@ import (
 )
 
 const (
-	USER_INDEX    = "user"
-	POST_INDEX    = "post"
-	LIKE_INDEX    = "like"
-	SHARE_INDEX   = "share"
-	COMMENT_INDEX = "comment"
-	FOLLOW_INDEX  = "follow"
+	USER_INDEX         = "user"
+	POST_INDEX         = "post"
+	LIKE_INDEX         = "like"
+	SHARE_INDEX        = "share"
+	COMMENT_INDEX      = "comment"
+	FOLLOW_INDEX       = "follow"
 	MESSAGE_INDEX      = "message"
 	NOTIFICATION_INDEX = "notification"
 
@@ -19,7 +19,7 @@ const (
 	REDIS_PASSWORD = ""
 	REDIS_DB       = 0
 
-	GCS_BUCKET      = "socialai_laioffer_202512"
+	GCS_BUCKET       = "socialai_laioffer_202512"
 	LOGSTASH_ADDRESS = "logstash:5000"
 )
 

@@ -10,8 +10,8 @@ import (
 	"socialai/services/post/service"
 	sharedBackend "socialai/shared/backend"
 	"socialai/shared/constants"
-	"socialai/shared/logger"
 	"socialai/shared/kafka"
+	"socialai/shared/logger"
 
 	"go.uber.org/zap"
 )

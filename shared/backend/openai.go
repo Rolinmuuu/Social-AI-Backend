@@ -3,10 +3,10 @@ package backend
 import (
 	"context"
 	"fmt"
+	openai "github.com/sashabaranov/go-openai"
 	"io"
 	"net/http"
 	"socialai/shared/constants"
-	openai "github.com/sashabaranov/go-openai"
 )
 
 type OpenAIBackend struct {
@@ -31,11 +31,11 @@ func InitOpenAIBackend() (OpenAIBackendInterface, error) {
 // and return the image URL
 func (b *OpenAIBackend) GenerateImage(ctx context.Context, prompt string) (string, error) {
 	response, err := b.client.CreateImage(ctx, openai.ImageRequest{
-		Prompt: prompt,
-		Model: openai.CreateImageModelDallE3,
-		N: 1,
-		Size: openai.CreateImageSize1024x1024,
-		Quality: openai.CreateImageQualityStandard,
+		Prompt:         prompt,
+		Model:          openai.CreateImageModelDallE3,
+		N:              1,
+		Size:           openai.CreateImageSize1024x1024,
+		Quality:        openai.CreateImageQualityStandard,
 		ResponseFormat: openai.CreateImageResponseFormatURL,
 	})
 	if err != nil {
@@ -63,7 +63,7 @@ func (b *OpenAIBackend) GetEmbedding(ctx context.Context, text string) ([]float3
 	return response.Data[0].Embedding, nil
 }
 
-// DownloadImage download the image from the URL 
+// DownloadImage download the image from the URL
 // and return the image bytes as io.ReadCloser
 func DownloadImage(url string) (io.ReadCloser, error) {
 	resp, err := http.Get(url)

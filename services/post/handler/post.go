@@ -12,8 +12,8 @@ import (
 	"socialai/shared/utils"
 
 	jwt "github.com/form3tech-oss/jwt-go"
-	"github.com/gorilla/mux"
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 )
 
 var mediaTypes = map[string]string{
@@ -117,6 +117,10 @@ func (h *PostHandler) deletePostHandler(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		if errors.Is(err, service.ErrPostNotFound) {
 			http.Error(w, `{"error":"post not found"}`, http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, service.ErrNotPostOwner) {
+			http.Error(w, `{"error":"only the author can delete this post"}`, http.StatusForbidden)
 			return
 		}
 		http.Error(w, `{"error":"failed to delete post"}`, http.StatusInternalServerError)
@@ -242,7 +246,6 @@ func (h *PostHandler) generateImageFromOpenAIHandler(w http.ResponseWriter, r *h
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
-
 
 	post, err := h.postSvc.GenerateImageFromOpenAIAndSavePost(r.Context(), userId, req.Prompt)
 	if err != nil {

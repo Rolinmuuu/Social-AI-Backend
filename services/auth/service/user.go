@@ -8,8 +8,8 @@ import (
 	"socialai/shared/constants"
 	"socialai/shared/model"
 
-	"golang.org/x/crypto/bcrypt"
 	"github.com/olivere/elastic/v7"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type UserService struct {

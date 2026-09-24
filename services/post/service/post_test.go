@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime/multipart"
@@ -32,8 +33,8 @@ type fakeFile struct {
 	*bytes.Reader
 }
 
-func (f *fakeFile) Close() error                              { return nil }
-func (f *fakeFile) ReadAt(p []byte, off int64) (int, error)   { return f.Reader.ReadAt(p, off) }
+func (f *fakeFile) Close() error                            { return nil }
+func (f *fakeFile) ReadAt(p []byte, off int64) (int, error) { return f.Reader.ReadAt(p, off) }
 func (f *fakeFile) Seek(offset int64, whence int) (int64, error) {
 	return f.Reader.Seek(offset, whence)
 }
@@ -169,6 +170,19 @@ func TestDeletePost_Success(t *testing.T) {
 	deleted, err := svc.DeletePost("p1", "u1")
 	require.NoError(t, err)
 	assert.True(t, deleted)
+}
+
+func TestDeletePost_RejectsNonOwner(t *testing.T) {
+	svc, es, _, _, _, _ := newTestPostService()
+	es.SetDoc("post", "p1", model.Post{PostId: "p1", UserId: "u1"})
+
+	deleted, err := svc.DeletePost("p1", "u2")
+	assert.ErrorIs(t, err, ErrNotPostOwner)
+	assert.False(t, deleted)
+
+	var stored model.Post
+	require.NoError(t, json.Unmarshal(es.Docs["post"]["p1"], &stored))
+	assert.False(t, stored.Deleted, "a non-owner must not be able to mark the post deleted")
 }
 
 func TestDeletePost_NotFound(t *testing.T) {

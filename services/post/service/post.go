@@ -19,11 +19,11 @@ import (
 
 // PostService encapsulates all post-related business logic.
 type PostService struct {
-	es    backend.ElasticsearchBackendInterface
-	redis backend.RedisBackendInterface
-	gcs   backend.GoogleCloudStorageBackendInterface
+	es     backend.ElasticsearchBackendInterface
+	redis  backend.RedisBackendInterface
+	gcs    backend.GoogleCloudStorageBackendInterface
 	openai backend.OpenAIBackendInterface
-	kafka kafka.KafkaProducerInterface
+	kafka  kafka.KafkaProducerInterface
 }
 
 func NewPostService(
@@ -133,11 +133,11 @@ func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
 
 	// Publish event to Kafka
 	event := model.PostCreatedEvent{
-		PostId: post.PostId,
-		UserId: post.UserId,
-		Message: post.Message,
-		Url: post.Url,
-		Type: post.Type,
+		PostId:    post.PostId,
+		UserId:    post.UserId,
+		Message:   post.Message,
+		Url:       post.Url,
+		Type:      post.Type,
 		CreatedAt: time.Now().Unix(),
 	}
 	if err := s.kafka.Publish(ctx, "post.created", post.PostId, event); err != nil {
@@ -164,6 +164,11 @@ func (s *PostService) DeletePost(postId, userId string) (bool, error) {
 	}
 
 	post := posts[0]
+	// Only the author may delete a post. Previously any authenticated user
+	// could delete any post by id.
+	if post.UserId != userId {
+		return false, ErrNotPostOwner
+	}
 	post.Deleted = true
 	post.DeletedAt = time.Now().Unix()
 	post.CleanupStatus = "pending"
@@ -175,7 +180,7 @@ func (s *PostService) DeletePost(postId, userId string) (bool, error) {
 	}
 
 	ctx := context.Background()
-	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(userId))
+	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(post.UserId))
 	return true, nil
 }
 
@@ -232,9 +237,9 @@ func (s *PostService) LikePost(postId, userId string) (bool, error) {
 
 	// Publish event to Kafka
 	event := model.PostLikedEvent{
-		PostId: postId,
-		LikerId: userId,
-		OwnerId: post.UserId,
+		PostId:    postId,
+		LikerId:   userId,
+		OwnerId:   post.UserId,
 		CreatedAt: time.Now().Unix(),
 	}
 	if err := s.kafka.Publish(ctx, "post.liked", postId, event); err != nil {

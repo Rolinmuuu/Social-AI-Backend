@@ -31,8 +31,8 @@ const (
 )
 
 type APIResponse struct {
-	RequestId string     `json:"request_id"`
-	Error     *APIError  `json:"error,omitempty"`
+	RequestId string      `json:"request_id"`
+	Error     *APIError   `json:"error,omitempty"`
 	Data      interface{} `json:"data,omitempty"`
 }
 

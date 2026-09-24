@@ -181,9 +181,9 @@ func (b *ElasticsearchBackend) IncrementFieldInES(index, id, field string, value
 func (b *ElasticsearchBackend) KNNSearchFromES(index, field string, vector []float32, k int) (*elastic.SearchResult, error) {
 	query := map[string]interface{}{
 		"knnQuery": map[string]interface{}{
-			"field": field,
-			"vector": vector,
-			"k": k,
+			"field":          field,
+			"vector":         vector,
+			"k":              k,
 			"num_candidates": k * 2,
 		},
 	}

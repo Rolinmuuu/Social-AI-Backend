@@ -3,17 +3,17 @@ package model
 import "time"
 
 type Post struct {
-	PostId        string `json:"post_id"`
-	UserId        string `json:"user_id"`
-	User          string `json:"user"`
-	Message       string `json:"message"`
-	Url           string `json:"url"`
-	Type          string `json:"type"`
-	Deleted       bool   `json:"deleted"`
-	DeletedAt     int64  `json:"deleted_at"`
-	CleanupStatus string `json:"cleanup_status"`
-	RetryCount    int    `json:"retry_count"`
-	LastError     string `json:"last_error"`
+	PostId        string    `json:"post_id"`
+	UserId        string    `json:"user_id"`
+	User          string    `json:"user"`
+	Message       string    `json:"message"`
+	Url           string    `json:"url"`
+	Type          string    `json:"type"`
+	Deleted       bool      `json:"deleted"`
+	DeletedAt     int64     `json:"deleted_at"`
+	CleanupStatus string    `json:"cleanup_status"`
+	RetryCount    int       `json:"retry_count"`
+	LastError     string    `json:"last_error"`
 	LikeCount     int       `json:"like_count"`
 	SharedCount   int       `json:"shared_count"`
 	Embedding     []float32 `json:"embedding,omitempty"`

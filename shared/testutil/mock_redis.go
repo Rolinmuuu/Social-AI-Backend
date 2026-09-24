@@ -10,11 +10,11 @@ import (
 
 // MockRedisBackend is an in-memory mock for RedisBackendInterface.
 type MockRedisBackend struct {
-	mu      sync.RWMutex
-	store   map[string]string
-	sets    map[string]map[string]bool
-	lists   map[string][]string
-	GetErr  error
+	mu     sync.RWMutex
+	store  map[string]string
+	sets   map[string]map[string]bool
+	lists  map[string][]string
+	GetErr error
 }
 
 func NewMockRedisBackend() *MockRedisBackend {
