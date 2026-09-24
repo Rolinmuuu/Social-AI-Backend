@@ -48,7 +48,7 @@ A high-concurrency, microservices-based social platform built with **Go**, **Kaf
 
 | Layer | Technology |
 |---|---|
-| Language | Go 1.21 |
+| Language | Go 1.25 |
 | API Gateway | Nginx (rate limiting, reverse proxy) |
 | Authentication | JWT (HS256) via `auth0/go-jwt-middleware` |
 | Primary Storage | Elasticsearch 8.13 |
