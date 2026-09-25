@@ -8,8 +8,6 @@ import (
 	"socialai/shared/backend"
 	"socialai/shared/constants"
 	"socialai/shared/model"
-
-	"github.com/google/uuid"
 )
 
 type NotificationWorker struct {
@@ -32,8 +30,10 @@ func (w *NotificationWorker) HandlePostLiked(key string, value []byte) error {
 		return nil
 	}
 
+	// Deterministic id: a redelivered event overwrites the same notification instead of
+	// notifying the owner twice (the consumer is at-least-once).
 	notification := model.Notification{
-		NotificationId: uuid.New().String(),
+		NotificationId: "like:" + event.PostId + ":" + event.LikerId,
 		UserId:         event.OwnerId,
 		Type:           "like",
 		ActorId:        event.LikerId,

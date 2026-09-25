@@ -41,6 +41,7 @@ func InitRouter(
 
 	router.Handle("/upload", jwtAuth.Handler(http.HandlerFunc(h.uploadPostHandler))).Methods("POST")
 	router.Handle("/search", jwtAuth.Handler(http.HandlerFunc(h.searchPostHandler))).Methods("GET")
+	router.Handle("/feed", jwtAuth.Handler(http.HandlerFunc(h.homeFeedHandler))).Methods("GET")
 	router.Handle("/post/{id}", jwtAuth.Handler(http.HandlerFunc(h.deletePostHandler))).Methods("DELETE")
 	router.Handle("/post/{id}/like", jwtAuth.Handler(http.HandlerFunc(h.likePostHandler))).Methods("POST")
 	router.Handle("/post/{id}/share", jwtAuth.Handler(http.HandlerFunc(h.sharePostHandler))).Methods("POST")
@@ -49,7 +50,7 @@ func InitRouter(
 
 	origins := handlers.AllowedOrigins([]string{"*"})
 	methods := handlers.AllowedMethods([]string{"GET", "POST", "DELETE", "OPTIONS"})
-	headers := handlers.AllowedHeaders([]string{"Content-Type", "Authorization"})
+	headers := handlers.AllowedHeaders([]string{"Content-Type", "Authorization", "Idempotency-Key"})
 
 	return handlers.CORS(origins, methods, headers)(router)
 }

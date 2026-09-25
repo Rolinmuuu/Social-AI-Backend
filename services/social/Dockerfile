@@ -1,4 +1,4 @@
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
@@ -7,13 +7,15 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o social-service ./services/social
+RUN CGO_ENABLED=0 GOOS=linux go build -o social-service ./services/social
 
 FROM debian:bookworm-slim
 
 WORKDIR /app
 
 COPY --from=builder /app/social-service .
+# The slim image has no CA bundle; without it HTTPS calls (OpenAI, GCS) fail TLS verification.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 8083
 

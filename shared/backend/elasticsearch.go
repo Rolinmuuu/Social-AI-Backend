@@ -41,7 +41,12 @@ func InitElasticsearchBackend() (ElasticsearchBackendInterface, error) {
 				"last_error":    { "type": "text" },
 				"like_count":    { "type": "integer" },
 				"shared_count":  { "type": "integer" },
-				"embedding":     { "type": "dense_vector", "dims": 1536, "index": true, "similarity": "cosine" }
+				"embedding":     { "type": "dense_vector", "dims": 1536, "index": true, "similarity": "cosine" },
+				"created_at":    { "type": "long" },
+				"outbox_status": { "type": "keyword" },
+				"outbox_attempts": { "type": "integer" },
+				"outbox_next_at":  { "type": "long" },
+				"outbox_error":    { "type": "text", "index": false }
 			}}}`,
 		constants.USER_INDEX: `{
 			"mappings": { "properties": {
@@ -123,11 +128,17 @@ func InitElasticsearchBackend() (ElasticsearchBackendInterface, error) {
 	return &ElasticsearchBackend{client: client}, nil
 }
 
+// withoutVectors keeps the 1536-float embedding out of search responses: it is only needed
+// inside Elasticsearch for kNN, and shipping it back added roughly 15-20 KB of JSON per post.
+func withoutVectors() *elastic.FetchSourceContext {
+	return elastic.NewFetchSourceContext(true).Exclude("embedding")
+}
+
 func (b *ElasticsearchBackend) ReadFromES(query elastic.Query, index string) (*elastic.SearchResult, error) {
 	return b.client.Search().
 		Index(index).
 		Query(query).
-		Pretty(true).
+		FetchSourceContext(withoutVectors()).
 		Do(context.Background())
 }
 
@@ -136,8 +147,55 @@ func (b *ElasticsearchBackend) ReadFromESWithSize(query elastic.Query, index str
 		Index(index).
 		Query(query).
 		Size(size).
-		Pretty(true).
+		FetchSourceContext(withoutVectors()).
 		Do(context.Background())
+}
+
+// SearchSorted returns up to size hits ordered by sortField, ties broken by post_id in the
+// same direction so the order is total (paging by (sortField, post_id) depends on that).
+// UnmappedType lets the sort run on an older index where the field does not exist yet.
+func (b *ElasticsearchBackend) SearchSorted(query elastic.Query, index, sortField string, ascending bool, size int) (*elastic.SearchResult, error) {
+	return b.client.Search().
+		Index(index).
+		Query(query).
+		SortBy(
+			elastic.NewFieldSort(sortField).Order(ascending).UnmappedType("long"),
+			elastic.NewFieldSort("post_id").Order(ascending).UnmappedType("keyword"),
+		).
+		Size(size).
+		FetchSourceContext(withoutVectors()).
+		Do(context.Background())
+}
+
+// CreateInES indexes the document only if the id does not exist yet (op_type=create).
+// created=false with a nil error means the document already existed. This makes the
+// like document the atomic, durable "has this user liked this post" check.
+func (b *ElasticsearchBackend) CreateInES(i interface{}, index string, id string) (bool, error) {
+	_, err := b.client.Index().
+		Index(index).
+		Id(id).
+		OpType("create").
+		BodyJson(i).
+		Do(context.Background())
+	if err != nil {
+		if elastic.IsConflict(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// UpdateFieldsInES merges fields into an existing document (partial update). Unlike a full
+// SaveToES of a document read earlier, it cannot overwrite counters that changed meanwhile.
+func (b *ElasticsearchBackend) UpdateFieldsInES(index string, id string, fields map[string]interface{}) error {
+	_, err := b.client.Update().
+		Index(index).
+		Id(id).
+		Doc(fields).
+		RetryOnConflict(3).
+		Do(context.Background())
+	return err
 }
 
 func (b *ElasticsearchBackend) SaveToES(i interface{}, index string, id string) error {

@@ -1,6 +1,21 @@
 # SocialAI — Distributed AI-Driven Social Network
 
-A high-concurrency, microservices-based social platform built with **Go**, **Kafka**, **Redis**, **Elasticsearch**, and **Docker**. Features AI-generated media via OpenAI DALL-E 3, asynchronous feed materialization, JWT authentication, and a full observability stack.
+A microservices social platform in **Go** with **Kafka**, **Redis**, **Elasticsearch** and **Docker**: AI-generated images (DALL·E 3), semantic search, hybrid push/pull home feeds, JWT auth and a Prometheus/ELK observability stack.
+
+Frontend and live demo: [Social-AI-Frontend](https://github.com/Rolinmuuu/Social-AI-Frontend).
+
+**Design docs:** [Architecture](docs/ARCHITECTURE.md) (write paths, consistency, concurrency) ·
+[Bottlenecks & evidence](docs/SCALING.md) (what saturates first, the test behind each claim, load test) ·
+[Cloud design](docs/CLOUD.md) (GCP target architecture, failure modes, delivery pipeline).
+
+| Concern | How it is handled | Code |
+|---|---|---|
+| Dual write (ES + Kafka) | transactional outbox inside the post document + relay with backoff | `shared/outbox` |
+| Client retries of paid/slow POSTs | `Idempotency-Key` with atomic claim, replay, 409/422 | `shared/idempotency` |
+| Fan-out cost, celebrity accounts | pipelined batches, push/pull switch, idempotent `ZADD` | `shared/feedplan` |
+| Hot post (many likes) | atomic `SADD` + `op_type=create`; write-behind counter | `shared/counter` |
+| Event processing | at-least-once, per-key order, parallel workers, in-order commits, DLQ | `shared/consumer` |
+| Cache stampede | single-flight + TTL jitter | `shared/cache` |
 
 ---
 
@@ -84,6 +99,9 @@ A high-concurrency, microservices-based social platform built with **Go**, **Kaf
 | POST | `/post/{id}/share` | JWT | Share a post to a platform |
 | POST | `/post/{id}/comment` | JWT | Add a comment or reply to a post |
 | POST | `/post/generate-image-from-openai` | JWT | Generate image with DALL-E 3 and auto-publish as a post |
+| GET | `/feed?limit=&cursor=` | JWT | Home feed: pushed posts merged with followed high-follower accounts, cursor paging |
+
+`POST /upload` and `POST /post/generate-image-from-openai` accept an `Idempotency-Key` header: a retried request replays the first response instead of creating a second post.
 | GET | `/health` | No | Health check |
 | GET | `/metrics` | No | Prometheus metrics |
 
@@ -109,43 +127,46 @@ A high-concurrency, microservices-based social platform built with **Go**, **Kaf
 
 ### `feed-worker` — Kafka Consumer (background worker)
 
-Consumes `post.created` events from Kafka. For each new post, queries the poster's followers from Elasticsearch and fan-outs the post into each follower's `home_feed:{userId}` Redis list (capped at 100 entries, 24-hour TTL). Decouples the expensive fan-out from the write path, keeping `POST /upload` fast under spiky traffic.
+Consumes `post.created`. Authors with up to 5,000 followers are **pushed**: the post id is added to each follower's `feed:home:{userId}` sorted set in pipelined batches of 500 (one Redis round trip per batch, 4 in flight). Authors above the threshold are **pulled**: they are recorded in `feed:celebrities` and `GET /feed` merges their recent posts at read time. Events are processed by 8 keyed workers per instance (one author's events stay in order), offsets are committed only when processed, and poison events go to `post.created.dlq`. Metrics on `:9101/metrics`.
+
+### `notification-worker`
+
+Consumes `post.liked` with the same consumer; notification ids are deterministic, so a redelivered event does not notify twice. Metrics on `:9102/metrics`.
 
 ---
 
 ## Key Design Decisions
 
-### Asynchronous Feed Materialization (Fan-out on Write)
+Details, diagrams and trade-offs: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-When a user creates a post, `post-service` publishes a `post.created` Kafka event immediately after writing to Elasticsearch, then returns `201 Created`. The `feed-worker` asynchronously distributes the post to all followers' Redis lists. This ensures write latency stays low regardless of follower count.
+- **Transactional outbox.** A post and its `post.created` event are one Elasticsearch document write. Publishing is attempted inline; if Kafka is down the upload still returns 201 and a relay retries with exponential backoff, parking an event as `dead` after 10 attempts. Delivery is at-least-once; consumers are idempotent.
+- **Idempotency keys** on upload and image generation: `SET NX` claim, stored response replayed for 24 h, `409` while in progress, `422` if the key is reused for another request. The work and its bookkeeping are detached from the HTTP connection, so a client that timed out and retries gets the first result.
+- **Hybrid fan-out** (see above) replaces a per-follower loop that made three sequential Redis calls per follower, duplicated entries on redelivery, and silently skipped followers beyond the first 10,000.
+- **Likes.** `SADD` (returns 1 only for the first caller) plus `op_type=create` on the like document make "check and write" one atomic step, so concurrent double taps count once. `like_count` / `shared_count` are write-behind: Redis `INCRBY`, flushed to Elasticsearch every 2 s as one update per post (per instance).
+- **Reliable consumer.** Retries with backoff, dead-letter topic, commits only the highest contiguous processed offset, bounded queues for backpressure. The producer partitions by author id (`Hash` balancer) so per-author order holds end to end.
+- **Cache stampede protection.** Single-flight on cache misses and ±20 % TTL jitter.
+- **Media cleanup (compensation).** Deleting a post is a soft delete; a background loop removes the GCS object and retries up to 5 times. If the ES write fails during upload, the uploaded object is deleted.
+- **Graceful shutdown** on SIGTERM for the API (drain requests, wait for background loops, final counter flush) and workers (finish in-flight messages, commit their offsets).
+- **Known gaps** are listed at the end of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#8-known-gaps); nothing in this README is a measured latency or throughput figure yet.
 
-```
-POST /upload  →  ES + GCS  →  Kafka publish  →  201 (fast)
-                                    ↓ async
-                            feed-worker consumes
-                                    ↓
-                      Redis LPUSH home_feed:{followerId}  (for each follower)
-```
-
-### Redis Caching Strategy
+### Redis keys
 
 | Key Pattern | Type | Purpose | TTL |
 |---|---|---|---|
-| `user_feed:{userId}` | String (JSON) | Cache of a user's own posts | 10s |
-| `like_set:{postId}` | Set | Fast dedup check before ES query | No expiry |
-| `home_feed:{userId}` | List | Materialised follower feed (max 100 items) | 24h |
+| `user_feed:{userId}` | String (JSON) | Cache of a user's own posts | 10 s ± 20 % |
+| `like_set:{postId}` | Set | Atomic like de-duplication | none |
+| `feed:home:{userId}` | Sorted set (post id → created_at) | Materialised home feed, newest 500 | 7 days |
+| `feed:celebrities` | Set | Authors served by pull | none |
+| `cnt:{field}:{postId}`, `cnt:dirty` | String, Set | Unflushed counter deltas | until flushed |
+| `idem:{scope}:{userId}:{key}` | String (JSON) | Idempotency claim / stored response | 2 min / 24 h |
 
 ### JWT Authentication
 
-All protected routes validate a HS256 JWT signed with `JWT_SECRET`. The token contains `user_id` and `exp` claims. The `auth` service issues tokens; all other services validate them independently — no shared session state.
-
-### Media Cleanup (Saga Pattern)
-
-Deleting a post performs a soft-delete in Elasticsearch (sets `deleted=true`, `cleanup_status=pending`). A background goroutine in `post-service` polls every 10 seconds and removes orphaned GCS objects, updating `cleanup_status` to `completed` or retrying up to 5 times before marking `failed`.
+All protected routes validate a HS256 JWT signed with `JWT_SECRET`. The `auth` service issues tokens; the other services validate them independently, with no shared session state.
 
 ### Rate Limiting
 
-Nginx enforces `100 req/s` per IP with a burst of 200 at the gateway level, providing protection against traffic spikes before requests reach any Go service.
+Nginx enforces `100 req/s` per IP with a burst of 200 at the gateway level; the services also apply a per-IP token bucket.
 
 ---
 
@@ -215,8 +236,8 @@ docker compose up --build
 ### Run Tests
 
 ```bash
-# Unit + integration tests (default build tags)
-go test ./...
+# Unit tests, with the race detector (as in CI)
+go test -race ./...
 
 # Elasticsearch integration tests (requires a running ES instance)
 go test -tags=integration ./shared/backend/...
@@ -228,8 +249,12 @@ go test -tags=integration ./shared/backend/...
 
 GitHub Actions pipelines are defined in `.github/workflows/`:
 
-- **`ci.yml`** — runs `gofmt`, `go build ./...`, and `go test ./...` on every push and pull request.
-- **`cd.yml`** — builds and deploys services on merge to `main`.
+- **`ci.yml`** — `gofmt`, `go build`, `go vet` and `go test -race` on every push and pull request.
+- **`cd.yml`** — manual deploy (`workflow_dispatch`) once GCP secrets are configured. Target architecture: [docs/CLOUD.md](docs/CLOUD.md).
+
+### Load test
+
+`loadtest/k6-social.js` (browse, hot-post likes, idempotent uploads): see [docs/SCALING.md](docs/SCALING.md#load-test).
 
 ---
 

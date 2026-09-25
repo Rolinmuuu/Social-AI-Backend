@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,9 +11,13 @@ import (
 	"socialai/services/feed/worker"
 	sharedBackend "socialai/shared/backend"
 	"socialai/shared/constants"
+	"socialai/shared/consumer"
 	"socialai/shared/kafka"
 	"socialai/shared/logger"
+	"socialai/shared/metrics"
+	"socialai/shared/model"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -32,16 +37,39 @@ func main() {
 
 	feedWorker := worker.NewFeedWorker(esBackend, redisBackend)
 
-	consumer := kafka.NewKafkaConsumer(constants.KAFKA_BROKERS, "post.created", "feed-worker-group")
-	defer consumer.Close()
+	source := kafka.NewKafkaConsumer(constants.KAFKA_BROKERS, model.TopicPostCreated, "feed-worker-group")
+	defer source.Close()
+	dlq := kafka.NewKafkaProducer(constants.KAFKA_BROKERS)
+	defer dlq.Close()
 
-	// 监听系统信号，支持优雅退出
+	// Metrics endpoint for the worker (Prometheus scrapes :9101).
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(":9101", mux); err != nil {
+			log.Printf("metrics server: %v", err)
+		}
+	}()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Logger.Info("feed-worker starting", zap.Strings("brokers", constants.KAFKA_BROKERS))
+	c := &consumer.Consumer{
+		Source:  source,
+		DLQ:     dlq,
+		Metrics: metrics.Consumer{},
+		Config: consumer.Config{
+			Workers:  8, // authors are spread over 8 goroutines; one author's posts stay in order
+			DLQTopic: model.TopicPostCreated + ".dlq",
+		},
+		Logf: log.Printf,
+	}
 
-	if err := consumer.Consume(ctx, feedWorker.HandlePostCreated); err != nil {
+	logger.Logger.Info("feed-worker starting", zap.Strings("brokers", constants.KAFKA_BROKERS))
+	err = c.Run(ctx, func(_ context.Context, m consumer.Message) error {
+		return feedWorker.HandlePostCreated(string(m.Key), m.Value)
+	})
+	if err != nil {
 		logger.Logger.Error("feed-worker stopped", zap.Error(err))
 	}
 }

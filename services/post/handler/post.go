@@ -1,17 +1,20 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 
 	"socialai/services/post/service"
+	"socialai/shared/idempotency"
 	"socialai/shared/model"
 	"socialai/shared/utils"
 
-	jwt "github.com/form3tech-oss/jwt-go"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 )
@@ -37,12 +40,76 @@ func NewPostHandler(postSvc *service.PostService) *PostHandler {
 	return &PostHandler{postSvc: postSvc}
 }
 
-func (h *PostHandler) uploadPostHandler(w http.ResponseWriter, r *http.Request) {
+// writeJSON writes status and body as JSON.
+func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
 
-	token := r.Context().Value("user")
-	claims := token.(*jwt.Token).Claims.(jwt.MapClaims)
-	userId := claims["user_id"].(string)
+// withIdempotency runs fn at most once per (user, Idempotency-Key header). Retries of a
+// finished request get the stored response (header Idempotent-Replayed: true); a retry while
+// the first attempt is still running gets 409; reusing a key for a different request gets
+// 422. Without the header, fn just runs. Only 2xx responses are stored, so a failed attempt
+// can be retried with the same key.
+func (h *PostHandler) withIdempotency(w http.ResponseWriter, r *http.Request, scope, userId, fingerprint string, fn func() (int, interface{})) {
+	key := r.Header.Get("Idempotency-Key")
+	store := h.postSvc.Idempotency
+	if key == "" || store == nil {
+		status, body := fn()
+		writeJSON(w, status, body)
+		return
+	}
+	if len(key) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key too long"})
+		return
+	}
+	// Detached from the request: if the client disconnects mid-request, the work still
+	// finishes and its result must still be recorded (or the claim released), otherwise the
+	// retry that follows would see 409 until the lock expires and then run the work again.
+	ctx := context.WithoutCancel(r.Context())
+	replay, err := store.Begin(ctx, scope, userId, key, fingerprint)
+	switch {
+	case errors.Is(err, idempotency.ErrInProgress):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "a request with this Idempotency-Key is in progress"})
+		return
+	case errors.Is(err, idempotency.ErrKeyReused):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Idempotency-Key was used for a different request"})
+		return
+	case err != nil:
+		// Redis unavailable: serve the request rather than fail it; log that it was unprotected.
+		log.Printf("idempotency disabled for this request: %v", err)
+		status, body := fn()
+		writeJSON(w, status, body)
+		return
+	case replay != nil:
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Idempotent-Replayed", "true")
+		w.WriteHeader(replay.Status)
+		_, _ = w.Write(replay.Body)
+		return
+	}
+
+	status, body := fn()
+	data, _ := json.Marshal(body)
+	if status >= 200 && status < 300 {
+		if err := store.Complete(ctx, scope, userId, key, fingerprint, idempotency.Response{Status: status, Body: data}); err != nil {
+			log.Printf("idempotency: store response: %v", err)
+		}
+	} else if err := store.Release(ctx, scope, userId, key); err != nil {
+		log.Printf("idempotency: release: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(append(data, '\n'))
+}
+
+func (h *PostHandler) uploadPostHandler(w http.ResponseWriter, r *http.Request) {
+	userId, err := utils.GetUserIdFromJwtToken(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
 
 	p := model.Post{
 		PostId:  uuid.New().String(),
@@ -52,7 +119,7 @@ func (h *PostHandler) uploadPostHandler(w http.ResponseWriter, r *http.Request) 
 
 	file, header, err := r.FormFile("media_file")
 	if err != nil {
-		http.Error(w, `{"error":"media_file is required"}`, http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "media_file is required"})
 		return
 	}
 	defer file.Close()
@@ -64,14 +131,34 @@ func (h *PostHandler) uploadPostHandler(w http.ResponseWriter, r *http.Request) 
 		p.Type = "unknown"
 	}
 
-	if err := h.postSvc.SavePost(&p, file); err != nil {
-		fmt.Printf("upload error: %v\n", err)
-		http.Error(w, `{"error":"failed to save post"}`, http.StatusInternalServerError)
+	fp := idempotency.Fingerprint(p.Message, header.Filename, strconv.FormatInt(header.Size, 10))
+	h.withIdempotency(w, r, "upload", userId, fp, func() (int, interface{}) {
+		if err := h.postSvc.SavePost(&p, file); err != nil {
+			fmt.Printf("upload error: %v\n", err)
+			return http.StatusInternalServerError, map[string]string{"error": "failed to save post"}
+		}
+		return http.StatusCreated, map[string]string{"post_id": p.PostId}
+	})
+}
+
+// GET /feed?limit=20&cursor=... — the signed-in user's home feed.
+func (h *PostHandler) homeFeedHandler(w http.ResponseWriter, r *http.Request) {
+	userId, err := utils.GetUserIdFromJwtToken(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
-
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"post_id": p.PostId})
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	page, err := h.postSvc.GetHomeFeed(r.Context(), userId, limit, r.URL.Query().Get("cursor"))
+	if errors.Is(err, service.ErrBadCursor) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load feed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (h *PostHandler) searchPostHandler(w http.ResponseWriter, r *http.Request) {
@@ -94,8 +181,12 @@ func (h *PostHandler) searchPostHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"failed to search posts"}`, http.StatusInternalServerError)
 		return
 	}
+	public := make([]model.Post, len(posts))
+	for i, p := range posts {
+		public[i] = p.Public()
+	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{"posts": posts})
+	json.NewEncoder(w).Encode(map[string]interface{}{"posts": public})
 }
 
 func (h *PostHandler) deletePostHandler(w http.ResponseWriter, r *http.Request) {
@@ -233,26 +324,29 @@ func (h *PostHandler) addCommentToPostHandler(w http.ResponseWriter, r *http.Req
 }
 
 func (h *PostHandler) generateImageFromOpenAIHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	token := r.Context().Value("user")
-	claims := token.(*jwt.Token).Claims.(jwt.MapClaims)
-	userId := claims["user_id"].(string)
+	userId, err := utils.GetUserIdFromJwtToken(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
 
 	var req struct {
 		Prompt string `json:"prompt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
-		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
 
-	post, err := h.postSvc.GenerateImageFromOpenAIAndSavePost(r.Context(), userId, req.Prompt)
-	if err != nil {
-		http.Error(w, `{"error":"failed to generate image"}`, http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(post)
+	// Image generation is slow and paid: a client retry after a timeout must not generate
+	// and publish a second image. Clients send an Idempotency-Key per prompt submission.
+	h.withIdempotency(w, r, "generate", userId, idempotency.Fingerprint(req.Prompt), func() (int, interface{}) {
+		// Not tied to the client connection: a paid generation that was started is finished
+		// and recorded, so the client's retry gets the stored result instead of a new image.
+		post, err := h.postSvc.GenerateImageFromOpenAIAndSavePost(context.WithoutCancel(r.Context()), userId, req.Prompt)
+		if err != nil {
+			return http.StatusInternalServerError, map[string]string{"error": "failed to generate image"}
+		}
+		return http.StatusCreated, post.Public()
+	})
 }

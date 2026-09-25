@@ -4,73 +4,85 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"socialai/shared/backend"
 	"socialai/shared/constants"
+	"socialai/shared/feedplan"
 	"socialai/shared/model"
 
 	elastic "github.com/olivere/elastic/v7"
 )
 
-const homeFeedMaxLen = 100 // 每个用户最多缓存 100 条 Feed
-
 type FeedWorker struct {
-	es    backend.ElasticsearchBackendInterface
-	redis backend.RedisBackendInterface
+	es     backend.ElasticsearchBackendInterface
+	redis  backend.RedisBackendInterface
+	Policy feedplan.Policy
 }
 
 func NewFeedWorker(es backend.ElasticsearchBackendInterface, redis backend.RedisBackendInterface) *FeedWorker {
 	return &FeedWorker{es: es, redis: redis}
 }
 
-// HandlePostCreated 消费 "post.created" 事件，将新帖 fan-out 到所有粉丝的 Redis Feed 列表。
-// key = 发帖者 userId（用于 Kafka partition routing）
-// value = PostCreatedEvent JSON
+// HandlePostCreated consumes "post.created" and delivers the post to followers' home feeds.
+//
+//   - Authors with at most Policy.CelebrityThreshold followers: push. Followers are written in
+//     pipelined batches (one Redis round trip per BatchSize followers, a few batches in
+//     parallel) with ZADD keyed by post id, so a redelivered event is a no-op.
+//   - Authors above the threshold: pull. The author is added to the celebrity set and nothing
+//     is pushed; readers merge that author's posts at read time (PostService.GetHomeFeed).
+//     This also removes the old silent cap, where only the first 10,000 followers got the post.
+//
+// Returning an error makes the consumer retry the event with backoff (and dead-letter it
+// after the retry budget), so a partial Redis failure is completed on redelivery.
 func (w *FeedWorker) HandlePostCreated(key string, value []byte) error {
 	var event model.PostCreatedEvent
 	if err := json.Unmarshal(value, &event); err != nil {
 		return fmt.Errorf("unmarshal PostCreatedEvent: %w", err)
 	}
-
 	ctx := context.Background()
+	policy := w.Policy.Defaults()
 
-	// 查询发帖者的所有粉丝（follow 索引中 followee_id == event.UserId）
+	// Ask for one more follower than the threshold: enough to decide push vs pull without
+	// reading a celebrity's whole follower list.
 	query := elastic.NewTermQuery("followee_id", event.UserId)
-	result, err := w.es.ReadFromESWithSize(query, constants.FOLLOW_INDEX, 10000)
+	result, err := w.es.ReadFromESWithSize(query, constants.FOLLOW_INDEX, policy.CelebrityThreshold+1)
 	if err != nil {
 		return fmt.Errorf("fetch followers for user %s: %w", event.UserId, err)
 	}
-	if result.TotalHits() == 0 {
-		return nil // 没有粉丝，无需 fan-out
+	total := int(result.TotalHits())
+	if total == 0 {
+		return nil
 	}
 
-	// 把新帖序列化为 Feed 条目，存入每个粉丝的 Redis List
-	feedItem := model.Post{
-		PostId:  event.PostId,
-		UserId:  event.UserId,
-		Message: event.Message,
-		Url:     event.Url,
-		Type:    event.Type,
-	}
-	feedData, err := json.Marshal(feedItem)
-	if err != nil {
-		return fmt.Errorf("marshal feed item: %w", err)
+	if policy.Decide(total) == feedplan.Pull {
+		if err := w.redis.SAdd(ctx, backend.CelebritySetKey, event.UserId); err != nil {
+			return fmt.Errorf("mark %s as pull-mode author: %w", event.UserId, err)
+		}
+		log.Printf("feed: post %s by %s (%d+ followers) served by pull", event.PostId, event.UserId, total)
+		return nil
 	}
 
+	followers := make([]string, 0, len(result.Hits.Hits))
 	for _, hit := range result.Hits.Hits {
 		var follow model.Follow
-		if err := json.Unmarshal(hit.Source, &follow); err != nil {
+		if err := json.Unmarshal(hit.Source, &follow); err != nil || follow.FollowerId == "" {
 			continue
 		}
-		feedKey := fmt.Sprintf("home_feed:%s", follow.FollowerId)
-
-		// LPUSH 插入头部 → LTRIM 保留最新 100 条 → EXPIRE 24 小时 TTL
-		_ = w.redis.LPush(ctx, feedKey, feedData)
-		_ = w.redis.LTrim(ctx, feedKey, 0, homeFeedMaxLen-1)
-		_ = w.redis.Expire(ctx, feedKey, 24*time.Hour)
+		followers = append(followers, follow.FollowerId)
 	}
 
-	fmt.Printf("fan-out complete: post_id=%s followers=%d\n", event.PostId, result.TotalHits())
+	createdAt := event.CreatedAt
+	if createdAt == 0 {
+		createdAt = time.Now().Unix()
+	}
+	item := feedplan.Item{PostID: event.PostId, AuthorID: event.UserId, CreatedAt: createdAt}
+	start := time.Now()
+	trips, err := feedplan.FanOut(ctx, w.redis, followers, item, policy)
+	if err != nil {
+		return fmt.Errorf("fan-out post %s: %w", event.PostId, err)
+	}
+	log.Printf("feed: post %s pushed to %d followers in %d round trips (%s)", event.PostId, len(followers), trips, time.Since(start))
 	return nil
 }

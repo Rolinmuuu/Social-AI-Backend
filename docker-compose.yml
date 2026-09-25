@@ -41,7 +41,6 @@ services:
       - elasticsearch
       - redis
       - logstash
-      - openai
       - kafka
 
   social:
@@ -151,14 +150,20 @@ services:
     environment:
       - KAFKA_BROKER_ID=1
       - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_ADVERTISED_LISTENERS:PLAINTEXT_HOST://kafka:9092
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
       - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
       - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+      # Auto-created topics get 6 partitions (the image default is 1), so running more than one
+      # feed-worker (docker compose up --scale feed-worker=3) actually splits the work.
+      - KAFKA_NUM_PARTITIONS=6
 
   feed-worker:
     build:
       context: .
       dockerfile: services/feed/Dockerfile
+    # Scale horizontally: `docker compose up --scale feed-worker=3`. Kafka's consumer group
+    # splits partitions between instances; inside each, events run on 8 keyed workers.
     depends_on:
       - kafka
       - redis

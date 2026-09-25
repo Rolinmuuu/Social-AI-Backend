@@ -12,6 +12,15 @@ type PostCreatedEvent struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+// CreatedAtUnix lets the outbox relay measure publish lag.
+func (e PostCreatedEvent) CreatedAtUnix() int64 { return e.CreatedAt }
+
+// Topic names.
+const (
+	TopicPostCreated = "post.created"
+	TopicPostLiked   = "post.liked"
+)
+
 // Topic: "post.liked"
 // 触发时机: LikePost 成功后
 // 消费方: notification-worker (通知帖子作者)

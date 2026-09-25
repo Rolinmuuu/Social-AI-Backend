@@ -3,14 +3,22 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"mime/multipart"
 	"time"
 
 	"socialai/shared/backend"
+	"socialai/shared/cache"
 	"socialai/shared/constants"
+	"socialai/shared/counter"
+	"socialai/shared/feedplan"
+	"socialai/shared/idempotency"
 	"socialai/shared/kafka"
 	"socialai/shared/model"
+	"socialai/shared/outbox"
 	"socialai/shared/utils"
 
 	"github.com/google/uuid"
@@ -24,6 +32,19 @@ type PostService struct {
 	gcs    backend.GoogleCloudStorageBackendInterface
 	openai backend.OpenAIBackendInterface
 	kafka  kafka.KafkaProducerInterface
+
+	// Outbox relay for post.created (see shared/outbox and outbox_store.go).
+	Relay *outbox.Relay
+	// Write-behind like/share counters (see shared/counter).
+	Counters *counter.Counter
+	// Idempotency-Key store for POST /upload and image generation.
+	Idempotency *idempotency.Store
+	// Home feed policy (push/pull threshold, feed length).
+	FeedPolicy feedplan.Policy
+
+	loads    cache.Group // single-flight for cache misses
+	now      func() time.Time
+	download func(url string) (io.ReadCloser, error)
 }
 
 func NewPostService(
@@ -33,36 +54,47 @@ func NewPostService(
 	openai backend.OpenAIBackendInterface,
 	kafka kafka.KafkaProducerInterface,
 ) *PostService {
-	return &PostService{es: es, redis: redis, gcs: gcs, openai: openai, kafka: kafka}
+	s := &PostService{es: es, redis: redis, gcs: gcs, openai: openai, kafka: kafka, now: time.Now, download: backend.DownloadImage}
+	s.Relay = &outbox.Relay{Store: &esOutboxStore{es: es}, Publisher: kafka}
+	s.Counters = &counter.Counter{Store: redis, Sink: es, Index: constants.POST_INDEX}
+	s.Idempotency = &idempotency.Store{KV: redis}
+	return s
 }
 
+const userPostsTTL = 10 * time.Second
+
+// SearchPostByUserId is a read-through cache over ES. Misses for the same user are
+// single-flighted (one ES query however many requests miss at once) and the TTL is
+// jittered so entries written together do not expire together.
 func (s *PostService) SearchPostByUserId(userId string) ([]model.Post, error) {
 	ctx := context.Background()
 	cacheKey := utils.UserFeedCacheKey(userId)
 
-	// Check Redis cache first.
 	if cached, err := s.redis.Get(ctx, cacheKey); err == nil {
 		var posts []model.Post
 		if err := json.Unmarshal([]byte(cached), &posts); err == nil {
-			fmt.Printf("cache hit for user feed: %s\n", userId)
 			return posts, nil
 		}
 	}
 
-	query := elastic.NewBoolQuery().
-		Must(elastic.NewTermQuery("user_id", userId)).
-		MustNot(elastic.NewTermQuery("deleted", true))
-
-	searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
+	v, err, _ := s.loads.Do(cacheKey, func() (interface{}, error) {
+		query := elastic.NewBoolQuery().
+			Must(elastic.NewTermQuery("user_id", userId)).
+			MustNot(elastic.NewTermQuery("deleted", true))
+		searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
+		if err != nil {
+			return nil, err
+		}
+		posts := getPostFromSearchResult(searchResult)
+		if data, err := json.Marshal(posts); err == nil {
+			_ = s.redis.Set(ctx, cacheKey, data, cache.JitterTTL(userPostsTTL, 0.2))
+		}
+		return posts, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	posts := getPostFromSearchResult(searchResult)
-
-	if data, err := json.Marshal(posts); err == nil {
-		_ = s.redis.Set(ctx, cacheKey, data, 10*time.Second)
-	}
-	return posts, nil
+	return v.([]model.Post), nil
 }
 
 func (s *PostService) SearchPostByKeywords(keywords string) ([]model.Post, error) {
@@ -94,8 +126,10 @@ func (s *PostService) SemanticSearch(ctx context.Context, queryText string, topK
 	return getPostFromSearchResult(searchResult), nil
 }
 
-// SavePost persists a new post via Saga: GCS → ES → invalidate cache.
-// If ES save fails, the GCS file is deleted as compensation.
+// SavePost persists a new post: GCS upload, then one ES write that stores the post *and*
+// its post.created event (outbox). If the ES write fails, the GCS object is deleted
+// (compensation). Publishing to Kafka is attempted right away; if Kafka is unavailable the
+// request still succeeds and the outbox relay publishes later.
 func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
 	post.PostId = uuid.New().String()
 
@@ -119,8 +153,20 @@ func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
 		}
 	}
 
+	return s.persistNewPost(context.Background(), post)
+}
+
+// persistNewPost is the shared tail of upload and image generation.
+func (s *PostService) persistNewPost(ctx context.Context, post *model.Post) error {
+	post.CreatedAt = s.now().Unix()
+	post.OutboxStatus = model.OutboxPending
+	post.OutboxAttempts = 0
+	// The inline publish below normally succeeds within milliseconds; the relay only picks
+	// the record up if it is still pending 10s later, so the two rarely publish the same post.
+	post.OutboxNextAt = post.CreatedAt + 10
+
 	if err := s.es.SaveToES(post, constants.POST_INDEX, post.PostId); err != nil {
-		// Compensating transaction: remove the orphan GCS file.
+		// Compensating action: remove the orphan GCS file.
 		if deleteErr := s.gcs.DeleteFromGCS(post.PostId); deleteErr != nil {
 			fmt.Printf("CRITICAL: GCS orphan file, manual cleanup needed. post_id=%s es_err=%v gcs_err=%v\n",
 				post.PostId, err, deleteErr)
@@ -128,20 +174,13 @@ func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
 		return fmt.Errorf("failed to save to ES: %w", err)
 	}
 
-	ctx := context.Background()
 	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(post.UserId))
 
-	// Publish event to Kafka
-	event := model.PostCreatedEvent{
-		PostId:    post.PostId,
-		UserId:    post.UserId,
-		Message:   post.Message,
-		Url:       post.Url,
-		Type:      post.Type,
-		CreatedAt: time.Now().Unix(),
-	}
-	if err := s.kafka.Publish(ctx, "post.created", post.PostId, event); err != nil {
-		return fmt.Errorf("WARN: failed to publish event to Kafka: %w", err)
+	// Fast path; on failure the event stays pending and the relay retries it.
+	if err := s.Relay.PublishNow(ctx, recordFor(*post)); err != nil {
+		log.Printf("post %s saved; post.created deferred to the outbox relay: %v", post.PostId, err)
+	} else {
+		post.OutboxStatus = model.OutboxPublished
 	}
 	return nil
 }
@@ -169,13 +208,15 @@ func (s *PostService) DeletePost(postId, userId string) (bool, error) {
 	if post.UserId != userId {
 		return false, ErrNotPostOwner
 	}
-	post.Deleted = true
-	post.DeletedAt = time.Now().Unix()
-	post.CleanupStatus = "pending"
-	post.RetryCount = 0
-	post.LastError = ""
-
-	if err := s.es.SaveToES(&post, constants.POST_INDEX, post.PostId); err != nil {
+	// Partial update: rewriting the whole document read above could overwrite a like or
+	// share count that changed in between (lost update).
+	if err := s.es.UpdateFieldsInES(constants.POST_INDEX, post.PostId, map[string]interface{}{
+		"deleted":        true,
+		"deleted_at":     time.Now().Unix(),
+		"cleanup_status": "pending",
+		"retry_count":    0,
+		"last_error":     "",
+	}); err != nil {
 		return false, err
 	}
 
@@ -184,6 +225,14 @@ func (s *PostService) DeletePost(postId, userId string) (bool, error) {
 	return true, nil
 }
 
+// LikePost records one like per user and post.
+//
+// Concurrency: two requests from the same user (double tap, client retry) used to both pass
+// the "already liked?" check and both increment like_count. Now the check and the write are
+// one atomic step: SADD returns 1 only for the first caller, and the like document is created
+// with op_type=create, which Elasticsearch rejects if it already exists (the durable check
+// when Redis has been flushed). The count goes through the write-behind counter, so a hot
+// post costs one ES update per flush instead of one per like.
 func (s *PostService) LikePost(postId, userId string) (bool, error) {
 	if postId == "" || userId == "" {
 		return false, nil
@@ -203,47 +252,49 @@ func (s *PostService) LikePost(postId, userId string) (bool, error) {
 	}
 	post := posts[0]
 
-	// Check Redis set for duplicate like (fast path).
 	likeSetKey := fmt.Sprintf("like_set:%s", postId)
-	if alreadyLiked, err := s.redis.SIsMember(ctx, likeSetKey, userId); err == nil && alreadyLiked {
+	added, redisErr := s.redis.SAddCount(ctx, likeSetKey, userId)
+	if redisErr == nil && added == 0 {
 		return false, ErrAlreadyLiked
 	}
 
-	// Check ES for duplicate (slow path, source of truth).
 	likeId := postId + "_" + userId
-	likeResult, err := s.es.ReadFromES(elastic.NewTermQuery("post_like_id", likeId), constants.LIKE_INDEX)
-	if err != nil {
-		return false, err
-	}
-	if likeResult.TotalHits() > 0 {
-		_ = s.redis.SAdd(ctx, likeSetKey, userId)
-		return false, ErrAlreadyLiked
-	}
-
 	like := model.PostLike{
 		PostLikeId: likeId,
 		UserId:     userId,
 		PostId:     postId,
 		CreatedAt:  time.Now().Unix(),
 	}
-	if err := s.es.SaveToES(&like, constants.LIKE_INDEX, like.PostLikeId); err != nil {
+	created, err := s.es.CreateInES(&like, constants.LIKE_INDEX, like.PostLikeId)
+	if err != nil {
+		if redisErr == nil {
+			_ = s.redis.SRem(ctx, likeSetKey, userId) // let the user retry
+		}
 		return false, err
 	}
-	_ = post // post variable used to confirm existence; count updated via script
-	if err := s.es.IncrementFieldInES(constants.POST_INDEX, postId, "like_count", 1); err != nil {
-		return false, err
+	if !created {
+		return false, ErrAlreadyLiked
 	}
-	_ = s.redis.SAdd(ctx, likeSetKey, userId)
 
-	// Publish event to Kafka
+	if err := s.Counters.Incr(ctx, postId, "like_count", 1); err != nil {
+		if !errors.Is(err, counter.ErrNotRecorded) {
+			log.Printf("like counter: %v", err) // recorded; it will still be flushed
+		} else if err := s.es.IncrementFieldInES(constants.POST_INDEX, postId, "like_count", 1); err != nil {
+			// Redis unavailable: fall back to the direct (slower) ES increment.
+			return false, err
+		}
+	}
+
+	// Notifications are best-effort: the like is already durable, so a Kafka hiccup must not
+	// turn it into an error the client would retry.
 	event := model.PostLikedEvent{
 		PostId:    postId,
 		LikerId:   userId,
 		OwnerId:   post.UserId,
 		CreatedAt: time.Now().Unix(),
 	}
-	if err := s.kafka.Publish(ctx, "post.liked", postId, event); err != nil {
-		return false, fmt.Errorf("WARN: failed to publish event to Kafka: %w", err)
+	if err := s.kafka.Publish(ctx, model.TopicPostLiked, postId, event); err != nil {
+		log.Printf("like %s stored; post.liked notification dropped: %v", likeId, err)
 	}
 	return true, nil
 }
@@ -275,8 +326,12 @@ func (s *PostService) SharePost(postId, userId, platform string) (bool, error) {
 	if err := s.es.SaveToES(&share, constants.SHARE_INDEX, share.PostShareId); err != nil {
 		return false, err
 	}
-	if err := s.es.IncrementFieldInES(constants.POST_INDEX, postId, "shared_count", 1); err != nil {
-		return false, err
+	if err := s.Counters.Incr(context.Background(), postId, "shared_count", 1); err != nil {
+		if !errors.Is(err, counter.ErrNotRecorded) {
+			log.Printf("share counter: %v", err)
+		} else if err := s.es.IncrementFieldInES(constants.POST_INDEX, postId, "shared_count", 1); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }
@@ -300,19 +355,16 @@ func (s *PostService) CleanupDeletedPosts(limit int) (bool, error) {
 	}
 	for i := 0; i < limit; i++ {
 		post := posts[i]
+		fields := map[string]interface{}{"cleanup_status": "completed", "last_error": ""}
 		if err := s.gcs.DeleteFromGCS(post.PostId); err != nil {
-			post.RetryCount++
-			post.LastError = err.Error()
-			if post.RetryCount >= 5 {
-				post.CleanupStatus = "failed"
-			} else {
-				post.CleanupStatus = "pending"
+			retries := post.RetryCount + 1
+			status := "pending"
+			if retries >= 5 {
+				status = "failed"
 			}
-		} else {
-			post.CleanupStatus = "completed"
-			post.LastError = ""
+			fields = map[string]interface{}{"cleanup_status": status, "retry_count": retries, "last_error": err.Error()}
 		}
-		if err := s.es.SaveToES(&post, constants.POST_INDEX, post.PostId); err != nil {
+		if err := s.es.UpdateFieldsInES(constants.POST_INDEX, post.PostId, fields); err != nil {
 			return false, err
 		}
 	}
@@ -389,7 +441,7 @@ func (s *PostService) GenerateImageFromOpenAIAndSavePost(ctx context.Context, us
 		return nil, fmt.Errorf("failed to generate image: %w", err)
 	}
 
-	body, err := backend.DownloadImage(imageUrl)
+	body, err := s.download(imageUrl)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download image: %w", err)
 	}
@@ -414,11 +466,10 @@ func (s *PostService) GenerateImageFromOpenAIAndSavePost(ctx context.Context, us
 		fmt.Printf("WARNING: embedding generation failed, post saved without vector: %v\n", err)
 	}
 
-	if err := s.es.SaveToES(post, constants.POST_INDEX, post.PostId); err != nil {
-		_ = s.gcs.DeleteFromGCS(post.PostId)
-		return nil, fmt.Errorf("failed to save to ES: %w", err)
+	// Same path as uploads, so generated posts also reach followers' feeds (they were never
+	// published to Kafka before).
+	if err := s.persistNewPost(ctx, post); err != nil {
+		return nil, err
 	}
-
-	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(userId))
 	return post, nil
 }

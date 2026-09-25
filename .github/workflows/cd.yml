@@ -1,16 +1,24 @@
 name: CD
 
+# Manual deploy. It used to run on every push with `if: secrets.GCP_SA_KEY != ''` at job
+# level, which GitHub rejects (secrets are not available in job-level `if`), so every push
+# showed a failed CD run. Run it from the Actions tab once GCP secrets are configured.
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: ${{ secrets.GCP_SA_KEY != '' }}
+    env:
+      HAS_GCP_KEY: ${{ secrets.GCP_SA_KEY != '' }}
 
     steps:
+      - name: Check configuration
+        if: env.HAS_GCP_KEY != 'true'
+        run: |
+          echo "GCP_SA_KEY is not set; nothing to deploy."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
 

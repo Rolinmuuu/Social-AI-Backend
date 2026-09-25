@@ -17,6 +17,28 @@ type Post struct {
 	LikeCount     int       `json:"like_count"`
 	SharedCount   int       `json:"shared_count"`
 	Embedding     []float32 `json:"embedding,omitempty"`
+	CreatedAt     int64     `json:"created_at"`
+
+	// Transactional outbox: the post.created event is stored in the same document write as
+	// the post, and a relay publishes it (see shared/outbox). Not exposed to clients.
+	OutboxStatus   string `json:"outbox_status,omitempty"` // "pending" | "published" | "dead"
+	OutboxAttempts int    `json:"outbox_attempts,omitempty"`
+	OutboxNextAt   int64  `json:"outbox_next_at,omitempty"`
+	OutboxError    string `json:"outbox_error,omitempty"`
+}
+
+// Outbox states.
+const (
+	OutboxPending   = "pending"
+	OutboxPublished = "published"
+	OutboxDead      = "dead"
+)
+
+// Public returns the post without internal bookkeeping fields, for API responses.
+func (p Post) Public() Post {
+	p.OutboxStatus, p.OutboxAttempts, p.OutboxNextAt, p.OutboxError = "", 0, 0, ""
+	p.Embedding = nil
+	return p
 }
 
 type User struct {

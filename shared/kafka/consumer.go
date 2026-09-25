@@ -2,15 +2,14 @@ package kafka
 
 import (
 	"context"
-	"fmt"
+
+	"socialai/shared/consumer"
 
 	"github.com/segmentio/kafka-go"
 )
 
-const maxRetries = 3
-
-type MessageHandler func(key string, value []byte) error
-
+// KafkaConsumer adapts a kafka-go consumer-group Reader to consumer.Source. Processing,
+// retries, dead-lettering and commit ordering live in shared/consumer.
 type KafkaConsumer struct {
 	reader *kafka.Reader
 }
@@ -23,35 +22,24 @@ func NewKafkaConsumer(brokers []string, topic, groupID string) *KafkaConsumer {
 			GroupID:  groupID,
 			MinBytes: 1,
 			MaxBytes: 10e6,
+			// Commits are explicit (CommitMessages) and only for fully processed offsets.
+			CommitInterval: 0,
 		}),
 	}
 }
 
-// Consume blocks and processes messages. If a handler fails after maxRetries
-// attempts the message is committed and skipped to prevent poison-message loops.
-func (c *KafkaConsumer) Consume(ctx context.Context, handler MessageHandler) error {
-	for {
-		msg, err := c.reader.FetchMessage(ctx)
-		if err != nil {
-			return err
-		}
-
-		var lastErr error
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			if lastErr = handler(string(msg.Key), msg.Value); lastErr == nil {
-				break
-			}
-			fmt.Printf("handler error (attempt %d/%d) topic=%s offset=%d: %v\n",
-				attempt, maxRetries, msg.Topic, msg.Offset, lastErr)
-		}
-
-		if lastErr != nil {
-			fmt.Printf("SKIP poison message after %d retries: topic=%s offset=%d key=%s\n",
-				maxRetries, msg.Topic, msg.Offset, string(msg.Key))
-		}
-
-		_ = c.reader.CommitMessages(ctx, msg)
+// Fetch returns the next message without committing it.
+func (c *KafkaConsumer) Fetch(ctx context.Context) (consumer.Message, error) {
+	m, err := c.reader.FetchMessage(ctx)
+	if err != nil {
+		return consumer.Message{}, err
 	}
+	return consumer.Message{Topic: m.Topic, Partition: m.Partition, Offset: m.Offset, Key: m.Key, Value: m.Value}, nil
+}
+
+// Commit marks everything up to and including m.Offset in m's partition as processed.
+func (c *KafkaConsumer) Commit(ctx context.Context, m consumer.Message) error {
+	return c.reader.CommitMessages(ctx, kafka.Message{Topic: m.Topic, Partition: m.Partition, Offset: m.Offset})
 }
 
 func (c *KafkaConsumer) Close() error {
