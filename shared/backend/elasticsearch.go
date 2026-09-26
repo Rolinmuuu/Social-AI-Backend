@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	"socialai/shared/constants"
 
@@ -44,6 +45,9 @@ func InitElasticsearchBackend() (*ElasticsearchBackend, error) {
 		elastic.SetURL(constants.ES_URL),
 		elastic.SetBasicAuth(constants.ES_USERNAME, constants.ES_PASSWORD),
 		elastic.SetSniff(false),
+		// In docker compose the cluster takes a while to accept requests; without this the
+		// client gives up after 5 s and the service exits at startup.
+		elastic.SetHealthcheckTimeoutStartup(90*time.Second),
 	)
 	if err != nil {
 		return nil, err

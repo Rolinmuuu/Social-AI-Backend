@@ -54,8 +54,14 @@ func main() {
 		log.Printf("OPENAI_API_KEY not set: indexing without embeddings (keyword search only)")
 	}
 
-	source := kafka.NewKafkaGroupConsumer(constants.KAFKA_BROKERS,
-		[]string{model.TopicPostCreated, model.TopicPostDeleted}, "search-indexer-group")
+	topics := []string{model.TopicPostCreated, model.TopicPostDeleted}
+	tctx, tcancel := context.WithTimeout(ctx, 2*time.Minute)
+	if err := kafka.EnsureTopics(tctx, constants.KAFKA_BROKERS, topics...); err != nil {
+		log.Printf("%v (continuing; the consumer retries)", err)
+	}
+	tcancel()
+
+	source := kafka.NewKafkaGroupConsumer(constants.KAFKA_BROKERS, topics, "search-indexer-group")
 	defer source.Close()
 	dlq := kafka.NewKafkaProducer(constants.KAFKA_BROKERS)
 	defer dlq.Close()

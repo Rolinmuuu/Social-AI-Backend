@@ -41,6 +41,12 @@ func main() {
 
 	feedWorker := worker.NewFeedWorker(socialgraph.Graph{DB: pool}, redisBackend)
 
+	tctx, tcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if err := kafka.EnsureTopics(tctx, constants.KAFKA_BROKERS, model.TopicPostCreated); err != nil {
+		log.Printf("%v (continuing; the consumer retries)", err)
+	}
+	tcancel()
+
 	source := kafka.NewKafkaConsumer(constants.KAFKA_BROKERS, model.TopicPostCreated, "feed-worker-group")
 	defer source.Close()
 	dlq := kafka.NewKafkaProducer(constants.KAFKA_BROKERS)

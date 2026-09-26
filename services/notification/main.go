@@ -34,6 +34,12 @@ func main() {
 
 	nWorker := worker.NewNotificationWorker(pool)
 
+	tctx, tcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if err := kafka.EnsureTopics(tctx, constants.KAFKA_BROKERS, model.TopicPostLiked); err != nil {
+		log.Printf("%v (continuing; the consumer retries)", err)
+	}
+	tcancel()
+
 	source := kafka.NewKafkaConsumer(constants.KAFKA_BROKERS, model.TopicPostLiked, "notification-worker-group")
 	defer source.Close()
 	dlq := kafka.NewKafkaProducer(constants.KAFKA_BROKERS)
