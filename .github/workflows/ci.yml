@@ -70,11 +70,11 @@ jobs:
       - name: Validate docker-compose.yml
         run: JWT_SECRET=ci OPENAI_API_KEY=ci docker compose config -q
 
-  # The Elasticsearch and Kafka code against the real thing: external versions, tombstones,
-  # kNN and alias moves on Elasticsearch 8; topic creation and a consumer group joining a topic
-  # nobody has written to yet on Kafka.
+  # The Elasticsearch, Kafka and Redis code against the real thing: external versions,
+  # tombstones, kNN and alias moves on Elasticsearch 8; topic creation and a consumer group
+  # joining a topic nobody has written to yet on Kafka; home-feed paging on a Redis sorted set.
   integration:
-    name: Integration (real Elasticsearch and Kafka)
+    name: Integration (real Elasticsearch, Kafka and Redis)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -101,9 +101,19 @@ jobs:
           --health-interval 5s
           --health-timeout 20s
           --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     env:
       ES_URL: http://localhost:9200
       KAFKA_BROKERS: localhost:9092
+      REDIS_ADDRESS: localhost:6379
     steps:
       - name: Checkout
         uses: actions/checkout@v4

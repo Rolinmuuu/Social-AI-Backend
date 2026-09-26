@@ -117,8 +117,11 @@ func (r *RedisBackendImpl) FeedItems(ctx context.Context, key string, after feed
 		}
 		extra = ties
 	}
+	// go-redis takes Start/Stop as min/max and swaps them itself for Rev+ByScore (ZRANGE key
+	// max min BYSCORE REV). Passing them already reversed sent "-inf +inf", an empty range, so
+	// every home feed read came back empty; the in-memory test double did not notice.
 	zs, err := r.client.ZRangeArgsWithScores(ctx, redis.ZRangeArgs{
-		Key: key, Start: max, Stop: "-inf", ByScore: true, Rev: true, Count: int64(count) + extra,
+		Key: key, Start: "-inf", Stop: max, ByScore: true, Rev: true, Count: int64(count) + extra,
 	}).Result()
 	if err != nil {
 		return nil, err

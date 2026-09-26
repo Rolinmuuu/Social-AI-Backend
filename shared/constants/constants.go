@@ -22,7 +22,6 @@ const (
 	MESSAGE_INDEX      = "message"
 	NOTIFICATION_INDEX = "notification"
 
-	REDIS_ADDRESS  = "redis:6379"
 	REDIS_PASSWORD = ""
 	REDIS_DB       = 0
 
@@ -37,6 +36,8 @@ var (
 	ES_URL      = getEnvOrDefault("ES_URL", "http://elasticsearch:9200")
 	ES_USERNAME = getEnvOrDefault("ES_USERNAME", "elastic")
 	ES_PASSWORD = os.Getenv("ES_PASSWORD")
+
+	REDIS_ADDRESS = getEnvOrDefault("REDIS_ADDRESS", "redis:6379")
 
 	KAFKA_BROKERS = strings.Split(getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"), ",")
 
