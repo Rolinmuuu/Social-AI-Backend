@@ -9,7 +9,8 @@
 //	go test -tags=e2e -count=1 -v ./e2e/
 //
 // BASE_URL (default http://localhost), DATABASE_URL (default the compose database on
-// localhost:5432) and ES_URL (default http://localhost:9200) point it elsewhere.
+// localhost:5432) and ES_URL (default http://localhost:9200) point it elsewhere. From a
+// container on the compose network, also set MEDIA_DIAL_ADDR=gcs:4443.
 package e2e
 
 import (
@@ -240,7 +241,15 @@ func TestSystemEndToEnd(t *testing.T) {
 
 	// The media URL points at the object that was stored.
 	require.NotEmpty(t, inFeed.Url)
-	media, err := client.Get(inFeed.Url)
+	mediaReq, err := http.NewRequest(http.MethodGet, inFeed.Url, nil)
+	require.NoError(t, err)
+	if addr := os.Getenv("MEDIA_DIAL_ADDR"); addr != "" {
+		// Running inside the compose network: the URL says localhost:4443, the emulator is
+		// gcs:4443. Connect there but keep the Host header, which the emulator matches on.
+		mediaReq.Host = mediaReq.URL.Host
+		mediaReq.URL.Host = addr
+	}
+	media, err := client.Do(mediaReq)
 	require.NoError(t, err, "GET %s", inFeed.Url)
 	mediaBody, _ := io.ReadAll(media.Body)
 	media.Body.Close()
