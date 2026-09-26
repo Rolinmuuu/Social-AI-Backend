@@ -176,6 +176,8 @@ jobs:
       - name: No service crashed or restarted
         run: |
           docker compose ps -a --format json | jq -s -r 'if type=="array" and (.[0]|type)=="array" then .[0] else . end | .[] | "\(.Service) \(.State) \(.ExitCode)"' | tee states.txt
+          expected=$(docker compose config --services | wc -l)
+          if [ "$(wc -l < states.txt)" -ne "$expected" ]; then echo "expected $expected services in the list"; exit 1; fi
           bad=$(awk '($1=="migrate" && !($2=="exited" && $3==0)) || ($1!="migrate" && $2!="running")' states.txt)
           if [ -n "$bad" ]; then echo "Not healthy:"; echo "$bad"; exit 1; fi
           restarts=$(docker inspect --format '{{.Name}} {{.RestartCount}}' $(docker compose ps -aq) | awk '$2>0')
