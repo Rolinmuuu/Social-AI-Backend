@@ -1,26 +1,31 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
-	"socialai/shared/backend"
-	"socialai/shared/constants"
+	"socialai/shared/db"
 	"socialai/shared/model"
 )
 
+// NotificationWorker owns the notifications table.
 type NotificationWorker struct {
-	es backend.ElasticsearchBackendInterface
+	db db.Querier
 }
 
-func NewNotificationWorker(es backend.ElasticsearchBackendInterface) *NotificationWorker {
-	return &NotificationWorker{es: es}
+func NewNotificationWorker(q db.Querier) *NotificationWorker {
+	return &NotificationWorker{db: q}
 }
 
 // HandlePostLiked consumes "post.liked" events and creates a notification
 // for the post owner (unless the liker is the owner themselves).
-func (w *NotificationWorker) HandlePostLiked(key string, value []byte) error {
+//
+// The id is deterministic and the insert is ON CONFLICT DO NOTHING: a redelivered event
+// (delivery is at-least-once) neither notifies twice nor marks a read notification unread.
+func (w *NotificationWorker) HandlePostLiked(ctx context.Context, value []byte) error {
 	var event model.PostLikedEvent
 	if err := json.Unmarshal(value, &event); err != nil {
 		return fmt.Errorf("unmarshal PostLikedEvent: %w", err)
@@ -30,23 +35,20 @@ func (w *NotificationWorker) HandlePostLiked(key string, value []byte) error {
 		return nil
 	}
 
-	// Deterministic id: a redelivered event overwrites the same notification instead of
-	// notifying the owner twice (the consumer is at-least-once).
-	notification := model.Notification{
-		NotificationId: "like:" + event.PostId + ":" + event.LikerId,
-		UserId:         event.OwnerId,
-		Type:           "like",
-		ActorId:        event.LikerId,
-		PostId:         event.PostId,
-		Read:           false,
-		CreatedAt:      time.Now().Unix(),
+	createdAt := time.Now()
+	if event.CreatedAt > 0 {
+		createdAt = time.Unix(event.CreatedAt, 0)
 	}
-
-	if err := w.es.SaveToES(notification, constants.NOTIFICATION_INDEX, notification.NotificationId); err != nil {
+	tag, err := w.db.Exec(ctx, `
+		INSERT INTO notifications (notification_id, user_id, type, actor_id, post_id, created_at)
+		VALUES ($1, $2, 'like', $3, $4, $5)
+		ON CONFLICT (notification_id) DO NOTHING`,
+		"like:"+event.PostId+":"+event.LikerId, event.OwnerId, event.LikerId, event.PostId, createdAt)
+	if err != nil {
 		return fmt.Errorf("save notification: %w", err)
 	}
-
-	fmt.Printf("notification created: %s liked post %s (notify %s)\n",
-		event.LikerId, event.PostId, event.OwnerId)
+	if tag.RowsAffected() == 1 {
+		log.Printf("notification created: %s liked post %s (notify %s)", event.LikerId, event.PostId, event.OwnerId)
+	}
 	return nil
 }

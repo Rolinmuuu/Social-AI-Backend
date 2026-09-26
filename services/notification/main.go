@@ -7,11 +7,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"socialai/services/notification/worker"
-	sharedBackend "socialai/shared/backend"
 	"socialai/shared/constants"
 	"socialai/shared/consumer"
+	"socialai/shared/db"
 	"socialai/shared/kafka"
 	"socialai/shared/logger"
 	"socialai/shared/metrics"
@@ -25,12 +26,19 @@ func main() {
 	logger.InitLogger(constants.LOGSTASH_ADDRESS)
 	defer logger.Logger.Sync()
 
-	esBackend, err := sharedBackend.InitElasticsearchBackend()
+	pool, err := db.Open(context.Background(), constants.DATABASE_URL, 60*time.Second)
 	if err != nil {
-		log.Fatalf("ES init failed: %v", err)
+		log.Fatalf("PostgreSQL init failed: %v", err)
 	}
+	defer pool.Close()
 
-	nWorker := worker.NewNotificationWorker(esBackend)
+	nWorker := worker.NewNotificationWorker(pool)
+
+	tctx, tcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if err := kafka.EnsureTopics(tctx, constants.KAFKA_BROKERS, model.TopicPostLiked); err != nil {
+		log.Printf("%v (continuing; the consumer retries)", err)
+	}
+	tcancel()
 
 	source := kafka.NewKafkaConsumer(constants.KAFKA_BROKERS, model.TopicPostLiked, "notification-worker-group")
 	defer source.Close()
@@ -58,8 +66,8 @@ func main() {
 	}
 
 	logger.Logger.Info("notification-worker starting", zap.Strings("brokers", constants.KAFKA_BROKERS))
-	err = c.Run(ctx, func(_ context.Context, m consumer.Message) error {
-		return nWorker.HandlePostLiked(string(m.Key), m.Value)
+	err = c.Run(ctx, func(ctx context.Context, m consumer.Message) error {
+		return nWorker.HandlePostLiked(ctx, m.Value)
 	})
 	if err != nil {
 		logger.Logger.Error("notification-worker stopped", zap.Error(err))

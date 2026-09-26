@@ -1,69 +1,91 @@
 package service
 
 import (
+	"context"
+	"sync"
 	"testing"
 
+	"socialai/shared/db/dbtest"
 	"socialai/shared/model"
-	"socialai/shared/testutil"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 )
 
-func newTestUserService() (*UserService, *testutil.MockESBackend) {
-	es := testutil.NewMockESBackend()
-	svc := NewUserService(es)
-	return svc, es
+func newTestUserService(t *testing.T) *UserService {
+	return NewUserService(dbtest.New(t))
 }
 
-// ──────────────────────── AddUser ────────────────────────
-
 func TestAddUser_Success(t *testing.T) {
-	svc, es := newTestUserService()
+	svc := newTestUserService(t)
+	ctx := context.Background()
 
 	user := &model.User{UserId: "alice", Password: "secret123"}
-	err := svc.AddUser(user)
+	require.NoError(t, svc.AddUser(ctx, user))
 
-	require.NoError(t, err)
-	assert.NotNil(t, es.Docs["user"]["alice"], "user should be saved to ES")
-	assert.NotEqual(t, "secret123", user.Password, "password should be hashed")
-	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(user.Password), []byte("secret123")))
+	var stored string
+	require.NoError(t, svc.db.QueryRow(ctx, `SELECT password_hash FROM users WHERE user_id = 'alice'`).Scan(&stored))
+	assert.NotEqual(t, "secret123", stored, "password should be hashed")
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(stored), []byte("secret123")))
 }
 
 func TestAddUser_DuplicateUser(t *testing.T) {
-	svc, es := newTestUserService()
-	es.SetDoc("user", "alice", model.User{UserId: "alice", Password: "hashed"})
+	svc := newTestUserService(t)
+	ctx := context.Background()
+	require.NoError(t, svc.AddUser(ctx, &model.User{UserId: "alice", Password: "first"}))
 
-	user := &model.User{UserId: "alice", Password: "newpass"}
-	err := svc.AddUser(user)
-
+	err := svc.AddUser(ctx, &model.User{UserId: "alice", Password: "newpass"})
 	assert.ErrorIs(t, err, ErrUserAlreadyExisted)
+	assert.NoError(t, svc.CheckUser(ctx, "alice", "first"), "the first user's password must be untouched")
 }
 
-// ──────────────────────── CheckUser ────────────────────────
+// Ten sign-ups race for one id: exactly one wins, and it keeps its password.
+func TestAddUser_ConcurrentSignupsOneWinner(t *testing.T) {
+	svc := newTestUserService(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	results := make([]error, 10)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = svc.AddUser(ctx, &model.User{UserId: "bob", Password: string(rune('a' + i))})
+		}(i)
+	}
+	wg.Wait()
+
+	winner := -1
+	for i, err := range results {
+		if err == nil {
+			require.Equal(t, -1, winner, "two sign-ups succeeded")
+			winner = i
+		} else {
+			assert.ErrorIs(t, err, ErrUserAlreadyExisted)
+		}
+	}
+	require.NotEqual(t, -1, winner)
+	assert.NoError(t, svc.CheckUser(ctx, "bob", string(rune('a'+winner))))
+}
 
 func TestCheckUser_ValidCredentials(t *testing.T) {
-	svc, es := newTestUserService()
-	hashed, _ := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.DefaultCost)
-	es.SetDoc("user", "alice", model.User{UserId: "alice", Password: string(hashed)})
+	svc := newTestUserService(t)
+	ctx := context.Background()
+	require.NoError(t, svc.AddUser(ctx, &model.User{UserId: "alice", Password: "secret123"}))
 
-	err := svc.CheckUser("alice", "secret123")
-	assert.NoError(t, err)
+	assert.NoError(t, svc.CheckUser(ctx, "alice", "secret123"))
 }
 
 func TestCheckUser_WrongPassword(t *testing.T) {
-	svc, es := newTestUserService()
-	hashed, _ := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.DefaultCost)
-	es.SetDoc("user", "alice", model.User{UserId: "alice", Password: string(hashed)})
+	svc := newTestUserService(t)
+	ctx := context.Background()
+	require.NoError(t, svc.AddUser(ctx, &model.User{UserId: "alice", Password: "secret123"}))
 
-	err := svc.CheckUser("alice", "wrongpass")
-	assert.ErrorIs(t, err, ErrInvalidCredentials)
+	assert.ErrorIs(t, svc.CheckUser(ctx, "alice", "wrongpass"), ErrInvalidCredentials)
 }
 
 func TestCheckUser_UserNotFound(t *testing.T) {
-	svc, _ := newTestUserService()
-
-	err := svc.CheckUser("nobody", "pass")
-	assert.ErrorIs(t, err, ErrInvalidCredentials)
+	svc := newTestUserService(t)
+	assert.ErrorIs(t, svc.CheckUser(context.Background(), "nobody", "pass"), ErrInvalidCredentials)
 }

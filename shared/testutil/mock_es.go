@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -11,15 +12,16 @@ import (
 	"github.com/olivere/elastic/v7"
 )
 
-// MockESBackend is an in-memory mock for ElasticsearchBackendInterface.
+// MockESBackend is an in-memory ElasticsearchBackendInterface. It evaluates the
+// bool/term/terms/range/exists filters the services build (see es_query.go) and implements
+// external versioning like Elasticsearch: a write with a version not above the stored one
+// is rejected (applied=false).
 type MockESBackend struct {
-	Docs      map[string]map[string][]byte // index -> id -> JSON
-	SaveErr   error
-	ReadErr   error
-	DeleteErr error
-	// Increments records IncrementFieldInES calls: "index/id/field" -> total.
-	Increments map[string]int
-	// Queries counts read calls, to assert that caches absorb load (read with atomic).
+	Docs     map[string]map[string][]byte // index -> id -> JSON
+	Versions map[string]map[string]int64  // index -> id -> external version
+	SaveErr  error
+	ReadErr  error
+	// Queries counts read calls (read with atomic).
 	Queries int64
 	// ReadDelay simulates query latency.
 	ReadDelay time.Duration
@@ -28,29 +30,7 @@ type MockESBackend struct {
 }
 
 func NewMockESBackend() *MockESBackend {
-	return &MockESBackend{Docs: make(map[string]map[string][]byte)}
-}
-
-func (m *MockESBackend) SaveToES(i interface{}, index string, id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.save(i, index, id)
-}
-
-func (m *MockESBackend) save(i interface{}, index string, id string) error {
-	if m.SaveErr != nil {
-		return m.SaveErr
-	}
-	if m.Docs[index] == nil {
-		m.Docs[index] = make(map[string][]byte)
-	}
-	data, _ := json.Marshal(i)
-	m.Docs[index][id] = data
-	return nil
-}
-
-func (m *MockESBackend) ReadFromES(query elastic.Query, index string) (*elastic.SearchResult, error) {
-	return m.ReadFromESWithSize(query, index, 10)
+	return &MockESBackend{Docs: map[string]map[string][]byte{}, Versions: map[string]map[string]int64{}}
 }
 
 func (m *MockESBackend) ReadFromESWithSize(query elastic.Query, index string, size int) (*elastic.SearchResult, error) {
@@ -63,136 +43,79 @@ func (m *MockESBackend) ReadFromESWithSize(query elastic.Query, index string, si
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	docs := m.Docs[index]
+	ids := make([]string, 0, len(m.Docs[index]))
+	for id := range m.Docs[index] {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // deterministic "relevance" order for tests
 	var hits []*elastic.SearchHit
-	for id, data := range docs {
+	for _, id := range ids {
+		data := m.Docs[index][id]
 		var doc map[string]interface{}
 		_ = json.Unmarshal(data, &doc)
 		if !matches(query, doc) {
 			continue
 		}
-		rawMsg := json.RawMessage(data)
-		hits = append(hits, &elastic.SearchHit{
-			Id:     id,
-			Index:  index,
-			Source: rawMsg,
-		})
+		hits = append(hits, &elastic.SearchHit{Id: id, Index: index, Source: json.RawMessage(data)})
 	}
 	if size > 0 && len(hits) > size {
 		hits = hits[:size]
 	}
-	totalHits := &elastic.TotalHits{Value: int64(len(hits)), Relation: "eq"}
-	return &elastic.SearchResult{
-		Hits: &elastic.SearchHits{
-			TotalHits: totalHits,
-			Hits:      hits,
-		},
-	}, nil
+	return &elastic.SearchResult{Hits: &elastic.SearchHits{
+		TotalHits: &elastic.TotalHits{Value: int64(len(hits)), Relation: "eq"},
+		Hits:      hits,
+	}}, nil
 }
 
-func (m *MockESBackend) DeleteFromES(index string, id string) (bool, error) {
-	if m.DeleteErr != nil {
-		return false, m.DeleteErr
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.Docs[index] != nil {
-		delete(m.Docs[index], id)
-	}
-	return true, nil
+// KNNSearchFromES ignores the vector (no similarity maths) but applies the filter and k.
+func (m *MockESBackend) KNNSearchFromES(index, field string, vector []float32, k int, filter elastic.Query) (*elastic.SearchResult, error) {
+	return m.ReadFromESWithSize(filter, index, k)
 }
 
-func (m *MockESBackend) IncrementFieldInES(index, id, field string, value int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.Increments == nil {
-		m.Increments = make(map[string]int)
-	}
-	m.Increments[index+"/"+id+"/"+field] += value
-	return nil
-}
-
-// SearchSorted filters like the other mock reads and honours sort (with the post_id
-// tie-break) and size.
-func (m *MockESBackend) SearchSorted(query elastic.Query, index, sortField string, ascending bool, size int) (*elastic.SearchResult, error) {
-	res, err := m.ReadFromESWithSize(query, index, 0)
-	if err != nil {
-		return nil, err
-	}
-	hits := res.Hits.Hits
-	type sortKey struct {
-		v       float64
-		missing bool
-		id      string
-	}
-	key := func(h *elastic.SearchHit) sortKey {
-		var doc map[string]interface{}
-		_ = json.Unmarshal(h.Source, &doc)
-		v, ok := doc[sortField].(float64)
-		id, _ := doc["post_id"].(string)
-		return sortKey{v: v, missing: !ok, id: id}
-	}
-	// Like the real backend: sort by sortField, ties broken by post_id in the same direction,
-	// documents without sortField last.
-	sort.SliceStable(hits, func(i, j int) bool {
-		a, b := key(hits[i]), key(hits[j])
-		if a.missing != b.missing {
-			return !a.missing
-		}
-		if a.v != b.v {
-			if ascending {
-				return a.v < b.v
-			}
-			return a.v > b.v
-		}
-		if ascending {
-			return a.id < b.id
-		}
-		return a.id > b.id
-	})
-	if size > 0 && len(hits) > size {
-		hits = hits[:size]
-	}
-	res.Hits.Hits = hits
-	return res, nil
-}
-
-// CreateInES fails with created=false when the id already exists, like op_type=create.
-func (m *MockESBackend) CreateInES(i interface{}, index string, id string) (bool, error) {
+func (m *MockESBackend) IndexVersioned(index, id string, doc interface{}, version int64) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.SaveErr != nil {
 		return false, m.SaveErr
 	}
-	if _, exists := m.Docs[index][id]; exists {
+	if m.Versions[index] == nil {
+		m.Versions[index] = map[string]int64{}
+	}
+	if cur, ok := m.Versions[index][id]; ok && version <= cur {
 		return false, nil
 	}
-	return true, m.save(i, index, id)
-}
-
-// UpdateFieldsInES merges fields into the stored JSON document.
-func (m *MockESBackend) UpdateFieldsInES(index string, id string, fields map[string]interface{}) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.SaveErr != nil {
-		return m.SaveErr
-	}
-	raw, ok := m.Docs[index][id]
-	if !ok {
-		return fmt.Errorf("document %s/%s not found", index, id)
-	}
-	var doc map[string]interface{}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return err
-	}
-	for k, v := range fields {
-		doc[k] = v
+	if m.Docs[index] == nil {
+		m.Docs[index] = map[string][]byte{}
 	}
 	data, err := json.Marshal(doc)
 	if err != nil {
-		return err
+		return false, err
 	}
 	m.Docs[index][id] = data
+	m.Versions[index][id] = version
+	return true, nil
+}
+
+func (m *MockESBackend) Scan(_ context.Context, index string, fn func(id string, source json.RawMessage) error) error {
+	if m.ReadErr != nil {
+		return m.ReadErr
+	}
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.Docs[index]))
+	for id := range m.Docs[index] {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	docs := make([][]byte, len(ids))
+	for i, id := range ids {
+		docs[i] = m.Docs[index][id]
+	}
+	m.mu.RUnlock()
+	for i, id := range ids {
+		if err := fn(id, json.RawMessage(docs[i])); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -207,8 +130,11 @@ func (m *MockESBackend) Doc(index, id string, out interface{}) bool {
 	return json.Unmarshal(raw, out) == nil
 }
 
-func (m *MockESBackend) KNNSearchFromES(index string, field string, vector []float32, k int) (*elastic.SearchResult, error) {
-	return m.ReadFromES(nil, index)
+// Version returns the stored external version of a document (0 if absent).
+func (m *MockESBackend) Version(index, id string) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Versions[index][id]
 }
 
 // SetDoc is a test helper that puts a document directly into the mock store.

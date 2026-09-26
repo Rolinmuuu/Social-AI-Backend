@@ -1,6 +1,9 @@
 package testutil
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+)
 
 // MockOpenAIBackend is a mock for OpenAIBackendInterface.
 type MockOpenAIBackend struct {
@@ -8,6 +11,8 @@ type MockOpenAIBackend struct {
 	Embedding    []float32
 	GenerateErr  error
 	EmbeddingErr error
+	// EmbeddingCalls counts GetEmbedding calls (read with atomic).
+	EmbeddingCalls int64
 }
 
 func NewMockOpenAIBackend() *MockOpenAIBackend {
@@ -25,6 +30,7 @@ func (m *MockOpenAIBackend) GenerateImage(_ context.Context, _ string) (string, 
 }
 
 func (m *MockOpenAIBackend) GetEmbedding(_ context.Context, _ string) ([]float32, error) {
+	atomic.AddInt64(&m.EmbeddingCalls, 1)
 	if m.EmbeddingErr != nil {
 		return nil, m.EmbeddingErr
 	}

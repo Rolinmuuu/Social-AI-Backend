@@ -8,21 +8,24 @@ import (
 	"time"
 
 	"socialai/shared/backend"
-	"socialai/shared/constants"
 	"socialai/shared/feedplan"
 	"socialai/shared/model"
-
-	elastic "github.com/olivere/elastic/v7"
 )
 
+// Followers is the part of the social graph fan-out needs (socialgraph.Graph in production).
+type Followers interface {
+	FollowerCountUpTo(ctx context.Context, userID string, max int) (int, error)
+	AllFollowers(ctx context.Context, userID string, max int) ([]string, error)
+}
+
 type FeedWorker struct {
-	es     backend.ElasticsearchBackendInterface
+	graph  Followers
 	redis  backend.RedisBackendInterface
 	Policy feedplan.Policy
 }
 
-func NewFeedWorker(es backend.ElasticsearchBackendInterface, redis backend.RedisBackendInterface) *FeedWorker {
-	return &FeedWorker{es: es, redis: redis}
+func NewFeedWorker(graph Followers, redis backend.RedisBackendInterface) *FeedWorker {
+	return &FeedWorker{graph: graph, redis: redis}
 }
 
 // HandlePostCreated consumes "post.created" and delivers the post to followers' home feeds.
@@ -32,26 +35,24 @@ func NewFeedWorker(es backend.ElasticsearchBackendInterface, redis backend.Redis
 //     parallel) with ZADD keyed by post id, so a redelivered event is a no-op.
 //   - Authors above the threshold: pull. The author is added to the celebrity set and nothing
 //     is pushed; readers merge that author's posts at read time (PostService.GetHomeFeed).
-//     This also removes the old silent cap, where only the first 10,000 followers got the post.
+//
+// Followers come from the follows table in PostgreSQL. Counting stops at threshold+1, so
+// deciding push vs pull costs a bounded index scan even for an account with millions of
+// followers.
 //
 // Returning an error makes the consumer retry the event with backoff (and dead-letter it
 // after the retry budget), so a partial Redis failure is completed on redelivery.
-func (w *FeedWorker) HandlePostCreated(key string, value []byte) error {
+func (w *FeedWorker) HandlePostCreated(ctx context.Context, value []byte) error {
 	var event model.PostCreatedEvent
 	if err := json.Unmarshal(value, &event); err != nil {
 		return fmt.Errorf("unmarshal PostCreatedEvent: %w", err)
 	}
-	ctx := context.Background()
 	policy := w.Policy.Defaults()
 
-	// Ask for one more follower than the threshold: enough to decide push vs pull without
-	// reading a celebrity's whole follower list.
-	query := elastic.NewTermQuery("followee_id", event.UserId)
-	result, err := w.es.ReadFromESWithSize(query, constants.FOLLOW_INDEX, policy.CelebrityThreshold+1)
+	total, err := w.graph.FollowerCountUpTo(ctx, event.UserId, policy.CelebrityThreshold+1)
 	if err != nil {
-		return fmt.Errorf("fetch followers for user %s: %w", event.UserId, err)
+		return fmt.Errorf("count followers of %s: %w", event.UserId, err)
 	}
-	total := int(result.TotalHits())
 	if total == 0 {
 		return nil
 	}
@@ -64,13 +65,9 @@ func (w *FeedWorker) HandlePostCreated(key string, value []byte) error {
 		return nil
 	}
 
-	followers := make([]string, 0, len(result.Hits.Hits))
-	for _, hit := range result.Hits.Hits {
-		var follow model.Follow
-		if err := json.Unmarshal(hit.Source, &follow); err != nil || follow.FollowerId == "" {
-			continue
-		}
-		followers = append(followers, follow.FollowerId)
+	followers, err := w.graph.AllFollowers(ctx, event.UserId, policy.CelebrityThreshold)
+	if err != nil {
+		return fmt.Errorf("read followers of %s: %w", event.UserId, err)
 	}
 
 	createdAt := event.CreatedAt

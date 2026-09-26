@@ -7,9 +7,34 @@ on:
       - main
       - "feature/**"
 
+# pull-requests: write lets a failing job post its test output as a PR comment (the raw job
+# logs live in blob storage that some viewers cannot reach).
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Tests that touch SQL run against a real PostgreSQL (one fresh schema per test, see
+    # shared/db/dbtest). REQUIRE_DB makes them fail instead of skip if it is missing.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      REQUIRE_DB: "1"
 
     steps:
       - name: Checkout
@@ -34,7 +59,172 @@ jobs:
         run: go build ./...
 
       - name: Vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags=integration ./...
+          go vet -tags=e2e ./e2e/
 
       - name: Test (race detector)
         run: go test -race -count=1 ./...
+
+      - name: Validate docker-compose.yml
+        run: JWT_SECRET=ci OPENAI_API_KEY=ci docker compose config -q
+
+  # The Elasticsearch, Kafka and Redis code against the real thing: external versions,
+  # tombstones, kNN and alias moves on Elasticsearch 8; topic creation and a consumer group
+  # joining a topic nobody has written to yet on Kafka; home-feed paging on a Redis sorted set.
+  integration:
+    name: Integration (real Elasticsearch, Kafka and Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      elasticsearch:
+        image: elasticsearch:8.13.0
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -fs http://localhost:9200/_cluster/health?wait_for_status=yellow"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 40
+      kafka:
+        # KRaft single node; advertises localhost:9092, which the runner reaches through the port map.
+        image: apache/kafka:3.8.0
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 20s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      ES_URL: http://localhost:9200
+      KAFKA_BROKERS: localhost:9092
+      REDIS_ADDRESS: localhost:6379
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Integration tests
+        run: |
+          set -o pipefail
+          go test -tags=integration -count=1 -v ./shared/backend/ ./shared/kafka/ 2>&1 | tee integration.log
+
+      - name: Post failures to the PR
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo '### Integration tests failed'
+            echo '```'
+            grep -E -B2 -A25 -- '--- FAIL|^FAIL|panic:' integration.log | head -c 55000
+            echo '```'
+          } > comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+
+  # Every service in docker-compose.yml started together, then one client journey through the
+  # gateway that crosses each asynchronous path (outbox -> Kafka -> feed-worker,
+  # notification-worker, search-indexer). See e2e/e2e_test.go.
+  e2e:
+    name: End-to-end (docker compose, all services)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JWT_SECRET: e2e-secret
+      # Any non-empty key starts post-service; the indexer's embedding calls then fail and it
+      # indexes without vectors (keyword search), which is the documented degraded mode.
+      OPENAI_API_KEY: e2e-not-a-real-key
+      ES_PASSWORD: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start every service
+        run: docker compose up -d --build
+
+      - name: End-to-end test through the gateway
+        run: |
+          set -o pipefail
+          go test -tags=e2e -count=1 -v -timeout 20m ./e2e/ 2>&1 | tee e2e.log
+
+      - name: No service crashed or restarted
+        run: |
+          docker compose ps -a --format json | jq -s -r 'if type=="array" and (.[0]|type)=="array" then .[0] else . end | .[] | "\(.Service) \(.State) \(.ExitCode)"' | tee states.txt
+          expected=$(docker compose config --services | wc -l)
+          if [ "$(wc -l < states.txt)" -ne "$expected" ]; then echo "expected $expected services in the list"; exit 1; fi
+          bad=$(awk '($1=="migrate" && !($2=="exited" && $3==0)) || ($1!="migrate" && $2!="running")' states.txt)
+          if [ -n "$bad" ]; then echo "Not healthy:"; echo "$bad"; exit 1; fi
+          restarts=$(docker inspect --format '{{.Name}} {{.RestartCount}}' $(docker compose ps -aq) | awk '$2>0')
+          if [ -n "$restarts" ]; then echo "Restarted:"; echo "$restarts"; exit 1; fi
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=150
+
+      - name: Post failures to the PR
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo '### End-to-end failed'
+            echo '```'
+            tail -n 60 e2e.log 2>/dev/null || echo "(test did not run)"
+            echo
+            docker compose ps -a --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
+            echo '```'
+            echo '#### Outbox'
+            echo '```'
+            docker compose exec -T postgres psql -U socialai -d socialai -c "SELECT id, topic, status, attempts, left(last_error, 150) AS last_error FROM outbox ORDER BY id" 2>&1 | head -40
+            echo '```'
+            echo '#### Kafka topics and consumer groups'
+            echo '```'
+            docker compose exec -T kafka kafka-topics --bootstrap-server kafka:9092 --list 2>&1 | head -30
+            docker compose exec -T kafka kafka-consumer-groups --bootstrap-server kafka:9092 --describe --all-groups 2>&1 | head -40
+            echo '```'
+            echo '#### Redis keys'
+            echo '```'
+            docker compose exec -T redis redis-cli --scan 2>&1 | head -40
+            echo '```'
+            for s in post feed-worker search-indexer notification-worker nginx auth social message migrate gcs kafka elasticsearch; do
+              echo "<details><summary>$s</summary>"
+              echo
+              echo '```'
+              docker compose logs --no-color --no-log-prefix --tail=40 "$s" 2>&1 | cut -c1-300
+              echo '```'
+              echo '</details>'
+            done
+          } | head -c 60000 > comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+
+      - name: Stop
+        if: always()
+        run: docker compose down -v

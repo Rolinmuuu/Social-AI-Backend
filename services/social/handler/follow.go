@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"log"
 	"net/http"
+	"strconv"
 
 	"socialai/services/social/service"
+	"socialai/shared/pagecursor"
 	"socialai/shared/utils"
 )
 
@@ -19,12 +22,20 @@ func NewSocialHandler(socialSvc *service.SocialService) *SocialHandler {
 	return &SocialHandler{socialSvc: socialSvc}
 }
 
-func (h *SocialHandler) addFollowHandler(w http.ResponseWriter, r *http.Request) {
+func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
 
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (h *SocialHandler) addFollowHandler(w http.ResponseWriter, r *http.Request) {
 	followerId, err := utils.GetUserIdFromJwtToken(r)
 	if err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -32,35 +43,30 @@ func (h *SocialHandler) addFollowHandler(w http.ResponseWriter, r *http.Request)
 		FolloweeId string `json:"followee_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.FolloweeId == "" {
-		http.Error(w, `{"error":"followee_id is required"}`, http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "followee_id is required")
 		return
 	}
 
-	followId, err := h.socialSvc.AddFollow(followerId, req.FolloweeId)
-	if err != nil {
-		if errors.Is(err, service.ErrCannotFollowSelf) {
-			http.Error(w, `{"error":"cannot follow yourself"}`, http.StatusBadRequest)
-			return
-		}
-		if errors.Is(err, service.ErrAlreadyFollowing) {
-			http.Error(w, `{"error":"already following"}`, http.StatusConflict)
-			return
-		}
-		fmt.Printf("addFollow error: %v\n", err)
-		http.Error(w, `{"error":"failed to follow user"}`, http.StatusInternalServerError)
-		return
+	followId, err := h.socialSvc.AddFollow(r.Context(), followerId, req.FolloweeId)
+	switch {
+	case errors.Is(err, service.ErrCannotFollowSelf):
+		writeError(w, http.StatusBadRequest, "cannot follow yourself")
+	case errors.Is(err, service.ErrUserNotFound):
+		writeError(w, http.StatusNotFound, "user not found")
+	case errors.Is(err, service.ErrAlreadyFollowing):
+		writeError(w, http.StatusConflict, "already following")
+	case err != nil:
+		log.Printf("addFollow error: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to follow user")
+	default:
+		writeJSON(w, http.StatusCreated, map[string]string{"follow_id": followId})
 	}
-
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"follow_id": followId})
 }
 
 func (h *SocialHandler) removeFollowHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	followerId, err := utils.GetUserIdFromJwtToken(r)
 	if err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -68,55 +74,53 @@ func (h *SocialHandler) removeFollowHandler(w http.ResponseWriter, r *http.Reque
 		FolloweeId string `json:"followee_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.FolloweeId == "" {
-		http.Error(w, `{"error":"followee_id is required"}`, http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "followee_id is required")
 		return
 	}
 
-	if err := h.socialSvc.RemoveFollow(followerId, req.FolloweeId); err != nil {
-		if errors.Is(err, service.ErrNotFollowing) {
-			http.Error(w, `{"error":"not following this user"}`, http.StatusNotFound)
+	switch err := h.socialSvc.RemoveFollow(r.Context(), followerId, req.FolloweeId); {
+	case errors.Is(err, service.ErrNotFollowing):
+		writeError(w, http.StatusNotFound, "not following this user")
+	case err != nil:
+		log.Printf("removeFollow error: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to unfollow user")
+	default:
+		writeJSON(w, http.StatusOK, map[string]string{"message": "unfollowed successfully"})
+	}
+}
+
+// listHandler serves GET /follow/followers and /follow/following.
+//
+// Query: user_id (default: the caller), limit (default 50, max 200), cursor (next_cursor of
+// the previous page). Response: {"<key>": [...ids], "next_cursor": "..."}; next_cursor is
+// omitted on the last page.
+func (h *SocialHandler) listHandler(key string, list func(ctx context.Context, userId string, limit int, cursor string) (service.FollowPage, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		me, err := utils.GetUserIdFromJwtToken(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		fmt.Printf("removeFollow error: %v\n", err)
-		http.Error(w, `{"error":"failed to unfollow user"}`, http.StatusInternalServerError)
-		return
+		q := r.URL.Query()
+		userId := q.Get("user_id")
+		if userId == "" {
+			userId = me
+		}
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		page, err := list(r.Context(), userId, limit, q.Get("cursor"))
+		if errors.Is(err, pagecursor.ErrBad) {
+			writeError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
+		if err != nil {
+			log.Printf("%s error: %v", key, err)
+			writeError(w, http.StatusInternalServerError, "failed to get "+key)
+			return
+		}
+		body := map[string]interface{}{key: page.IDs}
+		if page.NextCursor != "" {
+			body["next_cursor"] = page.NextCursor
+		}
+		writeJSON(w, http.StatusOK, body)
 	}
-
-	json.NewEncoder(w).Encode(map[string]string{"message": "unfollowed successfully"})
-}
-
-func (h *SocialHandler) getFollowersHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	userId, err := utils.GetUserIdFromJwtToken(r)
-	if err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-		return
-	}
-
-	ids, err := h.socialSvc.GetFollowerIds(userId)
-	if err != nil {
-		http.Error(w, `{"error":"failed to get followers"}`, http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string][]string{"follower_ids": ids})
-}
-
-func (h *SocialHandler) getFollowingHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	userId, err := utils.GetUserIdFromJwtToken(r)
-	if err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-		return
-	}
-
-	ids, err := h.socialSvc.GetFollowingIds(userId)
-	if err != nil {
-		http.Error(w, `{"error":"failed to get following"}`, http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string][]string{"following_ids": ids})
 }

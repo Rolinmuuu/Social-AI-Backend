@@ -2,7 +2,6 @@ package testutil
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -11,6 +10,8 @@ import (
 
 	"socialai/shared/backend"
 	"socialai/shared/feedplan"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // MockRedisBackend is an in-memory mock for RedisBackendInterface.
@@ -58,7 +59,7 @@ func (m *MockRedisBackend) Get(_ context.Context, key string) (string, error) {
 	defer m.mu.RUnlock()
 	v, ok := m.store[key]
 	if !ok {
-		return "", errors.New("key not found")
+		return "", redis.Nil // like go-redis, so backend.IsNil works on the mock
 	}
 	return v, nil
 }

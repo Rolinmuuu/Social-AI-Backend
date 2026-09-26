@@ -24,6 +24,25 @@ func NewKafkaConsumer(brokers []string, topic, groupID string) *KafkaConsumer {
 			MaxBytes: 10e6,
 			// Commits are explicit (CommitMessages) and only for fully processed offsets.
 			CommitInterval: 0,
+			// Rejoin when the topic's partitions change, including a topic that did not exist
+			// yet when the group joined (it would otherwise stay unassigned until a restart).
+			WatchPartitionChanges: true,
+		}),
+	}
+}
+
+// NewKafkaGroupConsumer consumes several topics in one consumer group (the search indexer
+// reads post.created and post.deleted).
+func NewKafkaGroupConsumer(brokers []string, topics []string, groupID string) *KafkaConsumer {
+	return &KafkaConsumer{
+		reader: kafka.NewReader(kafka.ReaderConfig{
+			Brokers:               brokers,
+			GroupTopics:           topics,
+			GroupID:               groupID,
+			MinBytes:              1,
+			MaxBytes:              10e6,
+			CommitInterval:        0,
+			WatchPartitionChanges: true,
 		}),
 	}
 }
