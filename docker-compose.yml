@@ -19,12 +19,13 @@ services:
       dockerfile: services/auth/Dockerfile
     environment:
       - JWT_SECRET=${JWT_SECRET}
-      - ES_URL=http://elasticsearch:9200
-      - ES_PASSWORD=${ES_PASSWORD}
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
       - LOGSTASH_ADDRESS=logstash:5000
     depends_on:
-      - elasticsearch
-      - logstash
+      migrate:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_started
 
   post:
     build:
@@ -32,16 +33,23 @@ services:
       dockerfile: services/post/Dockerfile
     environment:
       - JWT_SECRET=${JWT_SECRET}
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
       - ES_URL=http://elasticsearch:9200
       - ES_PASSWORD=${ES_PASSWORD}
       - LOGSTASH_ADDRESS=logstash:5000
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - KAFKA_BROKERS=kafka:9092
     depends_on:
-      - elasticsearch
-      - redis
-      - logstash
-      - kafka
+      migrate:
+        condition: service_completed_successfully
+      elasticsearch:
+        condition: service_started
+      redis:
+        condition: service_started
+      logstash:
+        condition: service_started
+      kafka:
+        condition: service_started
 
   social:
     build:
@@ -49,12 +57,13 @@ services:
       dockerfile: services/social/Dockerfile
     environment:
       - JWT_SECRET=${JWT_SECRET}
-      - ES_URL=http://elasticsearch:9200
-      - ES_PASSWORD=${ES_PASSWORD}
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
       - LOGSTASH_ADDRESS=logstash:5000
     depends_on:
-      - elasticsearch
-      - logstash
+      migrate:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_started
 
   message:
     build:
@@ -62,14 +71,46 @@ services:
       dockerfile: services/message/Dockerfile
     environment:
       - JWT_SECRET=${JWT_SECRET}
-      - ES_URL=http://elasticsearch:9200
-      - ES_PASSWORD=${ES_PASSWORD}
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
       - LOGSTASH_ADDRESS=logstash:5000
     depends_on:
-      - elasticsearch
-      - logstash
+      migrate:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_started
 
   # ── Infrastructure ────────────────────────────────────────────────────────
+  # System of record: users, follows, posts, likes, comments, messages, outbox.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=socialai
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-socialai}
+      - POSTGRES_DB=socialai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U socialai -d socialai"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: applies migrations/ and exits. Services start only after it succeeded, so a
+  # failed migration stops the rollout instead of crash-looping every service.
+  migrate:
+    build:
+      context: .
+      dockerfile: cmd/Dockerfile
+    command: ["./migrate"]
+    environment:
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Search projection of posts only (built by search-indexer from PostgreSQL).
   elasticsearch:
     image: elasticsearch:8.13.0
     environment:
@@ -165,14 +206,17 @@ services:
     # Scale horizontally: `docker compose up --scale feed-worker=3`. Kafka's consumer group
     # splits partitions between instances; inside each, events run on 8 keyed workers.
     depends_on:
-      - kafka
-      - redis
-      - elasticsearch
-      - logstash
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+      logstash:
+        condition: service_started
     environment:
       - KAFKA_BROKERS=kafka:9092
-      - ES_URL=http://elasticsearch:9200
-      - ES_PASSWORD=${ES_PASSWORD}
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
       - LOGSTASH_ADDRESS=logstash:5000
 
   notification-worker:
@@ -180,14 +224,39 @@ services:
       context: .
       dockerfile: services/notification/Dockerfile
     depends_on:
-      - kafka
-      - elasticsearch
-      - logstash
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_started
+      logstash:
+        condition: service_started
     environment:
       - KAFKA_BROKERS=kafka:9092
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
+      - LOGSTASH_ADDRESS=logstash:5000
+
+  # Keeps the Elasticsearch post index in step with PostgreSQL (post.created/post.deleted).
+  search-indexer:
+    build:
+      context: .
+      dockerfile: services/indexer/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_started
+      elasticsearch:
+        condition: service_started
+      logstash:
+        condition: service_started
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - DATABASE_URL=postgres://socialai:${POSTGRES_PASSWORD:-socialai}@postgres:5432/socialai?sslmode=disable
       - ES_URL=http://elasticsearch:9200
       - ES_PASSWORD=${ES_PASSWORD}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LOGSTASH_ADDRESS=logstash:5000
 
 volumes:
+  pg_data:
   es_data:
