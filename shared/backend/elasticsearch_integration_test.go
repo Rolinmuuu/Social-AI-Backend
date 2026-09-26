@@ -11,8 +11,11 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
+
+	"socialai/shared/constants"
 
 	"github.com/olivere/elastic/v7"
 	"github.com/stretchr/testify/assert"
@@ -100,4 +103,66 @@ func TestPointAliasMovesAtomically(t *testing.T) {
 	res, err := testES.client.Aliases().Alias(alias).Do(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, []string{b}, res.IndicesByAlias(alias))
+}
+
+// post-service and search-indexer both run EnsureSearchIndex when they start, at the same
+// moment in docker compose. Every caller must succeed and the alias must end up on the index.
+func TestEnsureSearchIndexConcurrentStartup(t *testing.T) {
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	alias, index := "it-ensure-alias-"+suffix, "it-ensure-index-"+suffix
+	ctx := context.Background()
+	t.Cleanup(func() { _, _ = testES.client.DeleteIndex(index).Do(ctx) })
+
+	var wg sync.WaitGroup
+	errs := make([]error, 6)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = testES.EnsureSearchIndex(ctx, alias, index)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		assert.NoError(t, err, "caller %d", i)
+	}
+
+	res, err := testES.client.Aliases().Alias(alias).Do(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{index}, res.IndicesByAlias(alias))
+	require.NoError(t, testES.EnsureSearchIndex(ctx, alias, index), "second start is a no-op")
+}
+
+// The production read path: SearchPostIDs and NearestPostIDs query the "posts" alias that
+// InitElasticsearchBackend created with the strict production mapping.
+func TestSearchThroughProductionAlias(t *testing.T) {
+	ctx := context.Background()
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	live, gone := "it-live-"+suffix, "it-gone-"+suffix
+	word := "zebra" + suffix // unique, so other tests' documents cannot match
+	vec := make([]float32, 1536)
+	vec[1] = 1
+	t.Cleanup(func() {
+		for _, id := range []string{live, gone} {
+			_, _ = testES.client.Delete().Index(constants.SEARCH_POST_INDEX).Id(id).Do(ctx)
+		}
+	})
+
+	for _, id := range []string{live, gone} {
+		_, err := testES.IndexVersioned(constants.SEARCH_POST_ALIAS, id,
+			PostSearchDoc{PostId: id, UserId: "u1", Message: "a " + word + " at noon", Type: "image", CreatedAt: time.Now().Unix(), Embedding: vec}, 1)
+		require.NoError(t, err)
+	}
+	_, err := testES.IndexVersioned(constants.SEARCH_POST_ALIAS, gone, PostSearchDoc{PostId: gone, Deleted: true}, 2)
+	require.NoError(t, err)
+	refresh(t, constants.SEARCH_POST_ALIAS)
+
+	ids, err := SearchPostIDs(testES, word+" noon", 10)
+	require.NoError(t, err)
+	assert.Equal(t, []string{live}, ids)
+
+	ids, err = NearestPostIDs(testES, vec, 50)
+	require.NoError(t, err)
+	assert.Contains(t, ids, live)
+	assert.NotContains(t, ids, gone)
 }

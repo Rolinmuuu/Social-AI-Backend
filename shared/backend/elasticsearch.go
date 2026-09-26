@@ -53,20 +53,26 @@ func InitElasticsearchBackend() (*ElasticsearchBackend, error) {
 		return nil, err
 	}
 	b := &ElasticsearchBackend{client: client}
-	ctx := context.Background()
-	exists, err := client.IndexExists(constants.SEARCH_POST_ALIAS).Do(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("check alias %s: %w", constants.SEARCH_POST_ALIAS, err)
-	}
-	if !exists {
-		if err := b.CreateIndex(ctx, constants.SEARCH_POST_INDEX, PostSearchMapping); err != nil {
-			return nil, err
-		}
-		if err := b.PointAlias(ctx, constants.SEARCH_POST_ALIAS, constants.SEARCH_POST_INDEX); err != nil {
-			return nil, err
-		}
+	if err := b.EnsureSearchIndex(context.Background(), constants.SEARCH_POST_ALIAS, constants.SEARCH_POST_INDEX); err != nil {
+		return nil, err
 	}
 	return b, nil
+}
+
+// EnsureSearchIndex creates index with PostSearchMapping and points alias at it, unless the
+// alias already exists.
+func (b *ElasticsearchBackend) EnsureSearchIndex(ctx context.Context, alias, index string) error {
+	exists, err := b.client.IndexExists(alias).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("check alias %s: %w", alias, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := b.CreateIndex(ctx, index, PostSearchMapping); err != nil {
+		return err
+	}
+	return b.PointAlias(ctx, alias, index)
 }
 
 // withoutVectors keeps the 1536-float embedding out of search responses: it is only needed

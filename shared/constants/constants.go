@@ -26,7 +26,6 @@ const (
 	REDIS_PASSWORD = ""
 	REDIS_DB       = 0
 
-	GCS_BUCKET       = "socialai_laioffer_202512"
 	LOGSTASH_ADDRESS = "logstash:5000"
 )
 
@@ -42,6 +41,8 @@ var (
 	KAFKA_BROKERS = strings.Split(getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"), ",")
 
 	OPENAI_API_KEY = os.Getenv("OPENAI_API_KEY")
+
+	GCS_BUCKET = getEnvOrDefault("GCS_BUCKET", "socialai_laioffer_202512")
 )
 
 func getEnvOrDefault(key, defaultVal string) string {

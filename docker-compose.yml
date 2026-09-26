@@ -39,12 +39,19 @@ services:
       - LOGSTASH_ADDRESS=logstash:5000
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - KAFKA_BROKERS=kafka:9092
+      # Media goes to the local GCS emulator. To use a real bucket, set STORAGE_EMULATOR_HOST=
+      # (empty), GCS_BUCKET, GCS_PUBLIC_BASE_URL= and give the container credentials.
+      - STORAGE_EMULATOR_HOST=${STORAGE_EMULATOR_HOST-http://gcs:4443}
+      - GCS_BUCKET=${GCS_BUCKET:-socialai-media}
+      - GCS_PUBLIC_BASE_URL=${GCS_PUBLIC_BASE_URL-http://localhost:4443}
     depends_on:
       migrate:
         condition: service_completed_successfully
       elasticsearch:
         condition: service_started
       redis:
+        condition: service_started
+      gcs:
         condition: service_started
       logstash:
         condition: service_started
@@ -126,6 +133,15 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+  # Local stand-in for Google Cloud Storage (media uploads), so the stack runs without a GCP
+  # account. Objects are served at http://localhost:4443/<bucket>/<object>.
+  gcs:
+    image: fsouza/fake-gcs-server:1.56.1
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory",
+              "-public-host", "localhost", "-external-url", "http://gcs:4443"]
+    ports:
+      - "4443:4443"
 
   # ── Observability ─────────────────────────────────────────────────────────
   prometheus:
