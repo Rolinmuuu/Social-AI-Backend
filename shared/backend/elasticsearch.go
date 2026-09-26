@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -61,6 +62,11 @@ func InitElasticsearchBackend() (*ElasticsearchBackend, error) {
 
 // EnsureSearchIndex creates index with PostSearchMapping and points alias at it, unless the
 // alias already exists.
+//
+// post-service and search-indexer both call it at startup, at the same moment in docker
+// compose. Both can see "no alias" and try to create the index; the loser gets
+// resource_already_exists_exception, which is success for it (the index it wanted is there),
+// and adding the alias again is idempotent.
 func (b *ElasticsearchBackend) EnsureSearchIndex(ctx context.Context, alias, index string) error {
 	exists, err := b.client.IndexExists(alias).Do(ctx)
 	if err != nil {
@@ -69,10 +75,15 @@ func (b *ElasticsearchBackend) EnsureSearchIndex(ctx context.Context, alias, ind
 	if exists {
 		return nil
 	}
-	if err := b.CreateIndex(ctx, index, PostSearchMapping); err != nil {
+	if err := b.CreateIndex(ctx, index, PostSearchMapping); err != nil && !isAlreadyExists(err) {
 		return err
 	}
 	return b.PointAlias(ctx, alias, index)
+}
+
+func isAlreadyExists(err error) bool {
+	var e *elastic.Error
+	return errors.As(err, &e) && e.Details != nil && e.Details.Type == "resource_already_exists_exception"
 }
 
 // withoutVectors keeps the 1536-float embedding out of search responses: it is only needed
