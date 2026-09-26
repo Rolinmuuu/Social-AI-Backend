@@ -215,7 +215,7 @@ Backend/
 ### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) & Docker Compose v2
-- A Google Cloud project with a GCS bucket and Application Default Credentials
+- Nothing else for local use: media goes to a GCS emulator (fake-gcs-server) in compose. For a real bucket, see the environment variables below.
 - An OpenAI API key (image generation and embeddings; without it search is keyword-only)
 
 ### Environment Variables
@@ -227,7 +227,10 @@ JWT_SECRET=your-strong-secret-here
 POSTGRES_PASSWORD=choose-one        # optional, defaults to "socialai" for local use
 ES_PASSWORD=
 OPENAI_API_KEY=sk-...
-GCS_BUCKET=your-bucket-name
+# Real Cloud Storage instead of the local emulator (also mount Application Default Credentials):
+# STORAGE_EMULATOR_HOST=
+# GCS_PUBLIC_BASE_URL=
+# GCS_BUCKET=your-bucket-name
 ```
 
 ### Run with Docker Compose
@@ -248,6 +251,7 @@ docker compose up --build
 | Prometheus | http://localhost:9090 |
 | Grafana | http://localhost:3000 (admin / admin) |
 | Kafka | localhost:9092 |
+| GCS emulator (media) | http://localhost:4443/socialai-media/&lt;object&gt; |
 
 ### Run Tests
 
@@ -258,9 +262,16 @@ docker compose up -d postgres
 export TEST_DATABASE_URL="postgres://socialai:socialai@localhost:5432/socialai?sslmode=disable"
 go test -race ./...
 
-# Elasticsearch behaviour the in-memory double imitates (needs a running cluster)
-ES_URL=http://localhost:9200 go test -tags=integration ./shared/backend/...
+# Elasticsearch, Redis and Kafka behaviour the in-memory doubles imitate (needs the running stack)
+ES_URL=http://localhost:9200 REDIS_ADDRESS=localhost:6379 KAFKA_BROKERS=localhost:9092 \
+  go test -tags=integration ./shared/backend/ ./shared/kafka/
+
+# End to end: the whole compose stack, one user journey through the gateway
+JWT_SECRET=dev OPENAI_API_KEY=dummy docker compose up -d --build
+go test -tags=e2e -count=1 -v ./e2e/
 ```
+
+Kafka on `localhost:9092` needs the broker to advertise an address your machine can reach; compose advertises `kafka:9092`, so run the Kafka tests from a container on the compose network or against a broker that advertises `localhost`.
 
 ---
 
@@ -268,7 +279,10 @@ ES_URL=http://localhost:9200 go test -tags=integration ./shared/backend/...
 
 GitHub Actions pipelines are defined in `.github/workflows/`:
 
-- **`ci.yml`** — `gofmt`, `go build`, `go vet` (also with the `integration` tag), `go test -race` against a PostgreSQL service container, and `docker compose config`.
+- **`ci.yml`**, on pull requests and pushes to `main` / `feature/**`:
+  - `test` — `gofmt`, `go build`, `go vet`, `go test -race` against a PostgreSQL service container, `docker compose config`.
+  - `integration` — the integration-tagged tests against real Elasticsearch 8.13, Kafka and Redis.
+  - `e2e` — `docker compose up` of every service, then `e2e/e2e_test.go`: sign-up, follow, idempotent upload, fan-out to the follower's feed, keyword search, like → notification, comments, idempotent messages, delete → search tombstone, outbox fully published. Fails if any container exited or restarted.
 - **`cd.yml`** — manual deploy (`workflow_dispatch`) once GCP secrets are configured. Target architecture: [docs/CLOUD.md](docs/CLOUD.md).
 
 ### Load test
