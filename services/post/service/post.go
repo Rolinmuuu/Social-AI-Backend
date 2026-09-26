@@ -12,29 +12,37 @@ import (
 
 	"socialai/shared/backend"
 	"socialai/shared/cache"
-	"socialai/shared/constants"
 	"socialai/shared/counter"
+	"socialai/shared/db"
 	"socialai/shared/feedplan"
 	"socialai/shared/idempotency"
 	"socialai/shared/kafka"
 	"socialai/shared/model"
 	"socialai/shared/outbox"
+	"socialai/shared/socialgraph"
 	"socialai/shared/utils"
 
 	"github.com/google/uuid"
-	"github.com/olivere/elastic/v7"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// PostService encapsulates all post-related business logic.
+// PostService owns the posts, post_likes, post_shares and comments tables and the outbox.
+//
+// PostgreSQL is the system of record. Elasticsearch is only read, for keyword and vector
+// search, and every search hit is re-read from the database (livePostsByID), so a lagging
+// index can rank results but never show a deleted post or a stale count.
 type PostService struct {
+	db     *pgxpool.Pool
 	es     backend.ElasticsearchBackendInterface
 	redis  backend.RedisBackendInterface
 	gcs    backend.GoogleCloudStorageBackendInterface
 	openai backend.OpenAIBackendInterface
-	kafka  kafka.KafkaProducerInterface
+	graph  socialgraph.Graph
 
-	// Outbox relay for post.created (see shared/outbox and outbox_store.go).
-	Relay *outbox.Relay
+	// Outbox relay: publishes rows the request path wrote to the outbox table.
+	Relay  *outbox.Relay
+	Outbox *outbox.PGStore
 	// Write-behind like/share counters (see shared/counter).
 	Counters *counter.Counter
 	// Idempotency-Key store for POST /upload and image generation.
@@ -42,32 +50,55 @@ type PostService struct {
 	// Home feed policy (push/pull threshold, feed length).
 	FeedPolicy feedplan.Policy
 
-	loads    cache.Group // single-flight for cache misses
-	now      func() time.Time
-	download func(url string) (io.ReadCloser, error)
+	loads     cache.Group // single-flight for cache misses
+	userPosts func(ctx context.Context, userID string) ([]model.Post, error)
+	now       func() time.Time
+	download  func(url string) (io.ReadCloser, error)
 }
 
 func NewPostService(
+	pool *pgxpool.Pool,
 	es backend.ElasticsearchBackendInterface,
 	redis backend.RedisBackendInterface,
 	gcs backend.GoogleCloudStorageBackendInterface,
 	openai backend.OpenAIBackendInterface,
 	kafka kafka.KafkaProducerInterface,
 ) *PostService {
-	s := &PostService{es: es, redis: redis, gcs: gcs, openai: openai, kafka: kafka, now: time.Now, download: backend.DownloadImage}
-	s.Relay = &outbox.Relay{Store: &esOutboxStore{es: es}, Publisher: kafka}
-	s.Counters = &counter.Counter{Store: redis, Sink: es, Index: constants.POST_INDEX}
+	s := &PostService{
+		db: pool, es: es, redis: redis, gcs: gcs, openai: openai,
+		graph: socialgraph.Graph{DB: pool},
+		now:   time.Now, download: backend.DownloadImage,
+	}
+	s.Outbox = &outbox.PGStore{Pool: pool}
+	s.Relay = &outbox.Relay{Store: s.Outbox, Publisher: kafka}
+	s.Counters = &counter.Counter{Store: redis, Sink: pgCounterSink{db: pool}}
 	s.Idempotency = &idempotency.Store{KV: redis}
+	s.userPosts = s.loadUserPosts
 	return s
 }
 
-const userPostsTTL = 10 * time.Second
+// fastPathGrace is how long the relay leaves a new outbox row alone. The request publishes
+// it inline right after commit (normally within milliseconds); the relay only steps in for
+// rows still pending after that, so the two rarely publish the same event.
+const fastPathGrace = 10 * time.Second
 
-// SearchPostByUserId is a read-through cache over ES. Misses for the same user are
-// single-flighted (one ES query however many requests miss at once) and the TTL is
-// jittered so entries written together do not expire together.
-func (s *PostService) SearchPostByUserId(userId string) ([]model.Post, error) {
-	ctx := context.Background()
+// publishAfterCommit is the outbox fast path. A failure is only logged: the row is committed
+// and the relay will publish it.
+func (s *PostService) publishAfterCommit(ctx context.Context, rec outbox.Record) {
+	if err := s.Relay.PublishNow(ctx, rec); err != nil {
+		log.Printf("outbox: %s %s deferred to the relay: %v", rec.Topic, rec.ID, err)
+	}
+}
+
+// ──────────────────────────── reads ────────────────────────────
+
+const userPostsTTL = 10 * time.Second
+const userPostsLimit = 100
+
+// SearchPostByUserId returns a user's newest posts through a read-through cache. Misses for
+// the same user are single-flighted (one query however many requests miss at once) and the
+// TTL is jittered so entries written together do not expire together.
+func (s *PostService) SearchPostByUserId(ctx context.Context, userId string) ([]model.Post, error) {
 	cacheKey := utils.UserFeedCacheKey(userId)
 
 	if cached, err := s.redis.Get(ctx, cacheKey); err == nil {
@@ -78,16 +109,14 @@ func (s *PostService) SearchPostByUserId(userId string) ([]model.Post, error) {
 	}
 
 	v, err, _ := s.loads.Do(cacheKey, func() (interface{}, error) {
-		query := elastic.NewBoolQuery().
-			Must(elastic.NewTermQuery("user_id", userId)).
-			MustNot(elastic.NewTermQuery("deleted", true))
-		searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
+		// Detached: one caller giving up must not fail the query for everyone sharing it.
+		lctx := context.WithoutCancel(ctx)
+		posts, err := s.userPosts(lctx, userId)
 		if err != nil {
 			return nil, err
 		}
-		posts := getPostFromSearchResult(searchResult)
 		if data, err := json.Marshal(posts); err == nil {
-			_ = s.redis.Set(ctx, cacheKey, data, cache.JitterTTL(userPostsTTL, 0.2))
+			_ = s.redis.Set(lctx, cacheKey, data, cache.JitterTTL(userPostsTTL, 0.2))
 		}
 		return posts, nil
 	})
@@ -97,342 +126,105 @@ func (s *PostService) SearchPostByUserId(userId string) ([]model.Post, error) {
 	return v.([]model.Post), nil
 }
 
-func (s *PostService) SearchPostByKeywords(keywords string) ([]model.Post, error) {
-	baseQuery := elastic.NewMatchQuery("message", keywords).Operator("AND")
-	if keywords == "" {
-		baseQuery.ZeroTermsQuery("all")
-	}
-	query := elastic.NewBoolQuery().
-		Must(baseQuery).
-		MustNot(elastic.NewTermQuery("deleted", true))
+func (s *PostService) loadUserPosts(ctx context.Context, userID string) ([]model.Post, error) {
+	return queryPosts(ctx, s.db, `
+		SELECT `+postColumns+` FROM posts
+		WHERE user_id = $1 AND deleted_at IS NULL
+		ORDER BY created_at DESC, post_id DESC
+		LIMIT $2`, userID, userPostsLimit)
+}
 
-	searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
+// recentLimit bounds search results and the "all posts" listing.
+const recentLimit = 50
+
+// SearchPostByKeywords ranks posts in Elasticsearch and loads them from PostgreSQL. With no
+// keywords it lists the newest posts straight from the database.
+func (s *PostService) SearchPostByKeywords(ctx context.Context, keywords string) ([]model.Post, error) {
+	if keywords == "" {
+		return queryPosts(ctx, s.db, `
+			SELECT `+postColumns+` FROM posts WHERE deleted_at IS NULL
+			ORDER BY created_at DESC, post_id DESC LIMIT $1`, recentLimit)
+	}
+	ids, err := backend.SearchPostIDs(s.es, keywords, recentLimit)
 	if err != nil {
 		return nil, err
 	}
-	return getPostFromSearchResult(searchResult), nil
+	return livePostsByID(ctx, s.db, ids)
 }
 
+// SemanticSearch embeds the query, asks Elasticsearch for the nearest post vectors, and loads
+// those posts from PostgreSQL.
 func (s *PostService) SemanticSearch(ctx context.Context, queryText string, topK int) ([]model.Post, error) {
 	queryVector, err := s.openai.GetEmbedding(ctx, queryText)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate query embedding: %w", err)
 	}
-
-	searchResult, err := s.es.KNNSearchFromES(constants.POST_INDEX, "embedding", queryVector, topK)
+	ids, err := backend.NearestPostIDs(s.es, queryVector, topK)
 	if err != nil {
 		return nil, err
 	}
-	return getPostFromSearchResult(searchResult), nil
+	return livePostsByID(ctx, s.db, ids)
 }
 
-// SavePost persists a new post: GCS upload, then one ES write that stores the post *and*
-// its post.created event (outbox). If the ES write fails, the GCS object is deleted
-// (compensation). Publishing to Kafka is attempted right away; if Kafka is unavailable the
-// request still succeeds and the outbox relay publishes later.
-func (s *PostService) SavePost(post *model.Post, file multipart.File) error {
+// ──────────────────────────── create ────────────────────────────
+
+// SavePost stores an uploaded post: media to GCS, then one database transaction that inserts
+// the post and its post.created event. If the transaction fails, the GCS object is deleted
+// (compensation). The event is published right after commit; if Kafka is unavailable the
+// request still succeeds and the outbox relay publishes it later.
+//
+// The embedding for semantic search is no longer computed here: it was a second OpenAI call
+// (hundreds of ms) on every upload. The search indexer computes it asynchronously.
+func (s *PostService) SavePost(ctx context.Context, post *model.Post, file multipart.File) error {
 	post.PostId = uuid.New().String()
 
 	medialink, err := s.gcs.SaveToGCS(file, post.PostId)
 	if err != nil {
 		return fmt.Errorf("failed to save to GCS: %w", err)
 	}
-
 	post.Url = medialink
-	post.Deleted = false
-	post.DeletedAt = 0
-	post.CleanupStatus = ""
-	post.RetryCount = 0
-	post.LastError = ""
-
-	if post.Message != "" && s.openai != nil {
-		if emb, err := s.openai.GetEmbedding(context.Background(), post.Message); err == nil {
-			post.Embedding = emb
-		} else {
-			fmt.Printf("WARNING: embedding generation failed for post %s: %v\n", post.PostId, err)
-		}
-	}
-
-	return s.persistNewPost(context.Background(), post)
+	return s.persistNewPost(ctx, post)
 }
 
 // persistNewPost is the shared tail of upload and image generation.
 func (s *PostService) persistNewPost(ctx context.Context, post *model.Post) error {
-	post.CreatedAt = s.now().Unix()
-	post.OutboxStatus = model.OutboxPending
-	post.OutboxAttempts = 0
-	// The inline publish below normally succeeds within milliseconds; the relay only picks
-	// the record up if it is still pending 10s later, so the two rarely publish the same post.
-	post.OutboxNextAt = post.CreatedAt + 10
+	now := s.now()
+	post.CreatedAt = now.Unix()
+	post.Deleted, post.DeletedAt = false, 0
 
-	if err := s.es.SaveToES(post, constants.POST_INDEX, post.PostId); err != nil {
+	var rec outbox.Record
+	err := db.InTx(ctx, s.db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO posts (post_id, user_id, message, url, type, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			post.PostId, post.UserId, post.Message, post.Url, post.Type, time.Unix(post.CreatedAt, 0)); err != nil {
+			return err
+		}
+		var err error
+		rec, err = outbox.Enqueue(ctx, tx, outbox.Event{
+			AggregateType: "post",
+			AggregateID:   post.PostId,
+			Topic:         model.TopicPostCreated,
+			Key:           post.UserId, // one author's events stay in order on one partition
+			Payload: model.PostCreatedEvent{
+				PostId: post.PostId, UserId: post.UserId, Message: post.Message,
+				Url: post.Url, Type: post.Type, CreatedAt: post.CreatedAt,
+			},
+		}, now.Add(fastPathGrace))
+		return err
+	})
+	if err != nil {
 		// Compensating action: remove the orphan GCS file.
 		if deleteErr := s.gcs.DeleteFromGCS(post.PostId); deleteErr != nil {
-			fmt.Printf("CRITICAL: GCS orphan file, manual cleanup needed. post_id=%s es_err=%v gcs_err=%v\n",
+			log.Printf("CRITICAL: GCS orphan file, manual cleanup needed. post_id=%s db_err=%v gcs_err=%v",
 				post.PostId, err, deleteErr)
 		}
-		return fmt.Errorf("failed to save to ES: %w", err)
+		return fmt.Errorf("failed to save post: %w", err)
 	}
 
 	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(post.UserId))
-
-	// Fast path; on failure the event stays pending and the relay retries it.
-	if err := s.Relay.PublishNow(ctx, recordFor(*post)); err != nil {
-		log.Printf("post %s saved; post.created deferred to the outbox relay: %v", post.PostId, err)
-	} else {
-		post.OutboxStatus = model.OutboxPublished
-	}
+	s.publishAfterCommit(ctx, rec)
 	return nil
-}
-
-func (s *PostService) DeletePost(postId, userId string) (bool, error) {
-	if postId == "" || userId == "" {
-		return false, nil
-	}
-
-	query := elastic.NewBoolQuery().
-		Must(elastic.NewTermQuery("post_id", postId)).
-		MustNot(elastic.NewTermQuery("deleted", true))
-	searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
-	if err != nil {
-		return false, err
-	}
-	posts := getPostFromSearchResult(searchResult)
-	if len(posts) == 0 {
-		return false, ErrPostNotFound
-	}
-
-	post := posts[0]
-	// Only the author may delete a post. Previously any authenticated user
-	// could delete any post by id.
-	if post.UserId != userId {
-		return false, ErrNotPostOwner
-	}
-	// Partial update: rewriting the whole document read above could overwrite a like or
-	// share count that changed in between (lost update).
-	if err := s.es.UpdateFieldsInES(constants.POST_INDEX, post.PostId, map[string]interface{}{
-		"deleted":        true,
-		"deleted_at":     time.Now().Unix(),
-		"cleanup_status": "pending",
-		"retry_count":    0,
-		"last_error":     "",
-	}); err != nil {
-		return false, err
-	}
-
-	ctx := context.Background()
-	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(post.UserId))
-	return true, nil
-}
-
-// LikePost records one like per user and post.
-//
-// Concurrency: two requests from the same user (double tap, client retry) used to both pass
-// the "already liked?" check and both increment like_count. Now the check and the write are
-// one atomic step: SADD returns 1 only for the first caller, and the like document is created
-// with op_type=create, which Elasticsearch rejects if it already exists (the durable check
-// when Redis has been flushed). The count goes through the write-behind counter, so a hot
-// post costs one ES update per flush instead of one per like.
-func (s *PostService) LikePost(postId, userId string) (bool, error) {
-	if postId == "" || userId == "" {
-		return false, nil
-	}
-	ctx := context.Background()
-
-	query := elastic.NewBoolQuery().
-		Must(elastic.NewTermQuery("post_id", postId)).
-		MustNot(elastic.NewTermQuery("deleted", true))
-	searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
-	if err != nil {
-		return false, err
-	}
-	posts := getPostFromSearchResult(searchResult)
-	if len(posts) == 0 {
-		return false, ErrPostNotFound
-	}
-	post := posts[0]
-
-	likeSetKey := fmt.Sprintf("like_set:%s", postId)
-	added, redisErr := s.redis.SAddCount(ctx, likeSetKey, userId)
-	if redisErr == nil && added == 0 {
-		return false, ErrAlreadyLiked
-	}
-
-	likeId := postId + "_" + userId
-	like := model.PostLike{
-		PostLikeId: likeId,
-		UserId:     userId,
-		PostId:     postId,
-		CreatedAt:  time.Now().Unix(),
-	}
-	created, err := s.es.CreateInES(&like, constants.LIKE_INDEX, like.PostLikeId)
-	if err != nil {
-		if redisErr == nil {
-			_ = s.redis.SRem(ctx, likeSetKey, userId) // let the user retry
-		}
-		return false, err
-	}
-	if !created {
-		return false, ErrAlreadyLiked
-	}
-
-	if err := s.Counters.Incr(ctx, postId, "like_count", 1); err != nil {
-		if !errors.Is(err, counter.ErrNotRecorded) {
-			log.Printf("like counter: %v", err) // recorded; it will still be flushed
-		} else if err := s.es.IncrementFieldInES(constants.POST_INDEX, postId, "like_count", 1); err != nil {
-			// Redis unavailable: fall back to the direct (slower) ES increment.
-			return false, err
-		}
-	}
-
-	// Notifications are best-effort: the like is already durable, so a Kafka hiccup must not
-	// turn it into an error the client would retry.
-	event := model.PostLikedEvent{
-		PostId:    postId,
-		LikerId:   userId,
-		OwnerId:   post.UserId,
-		CreatedAt: time.Now().Unix(),
-	}
-	if err := s.kafka.Publish(ctx, model.TopicPostLiked, postId, event); err != nil {
-		log.Printf("like %s stored; post.liked notification dropped: %v", likeId, err)
-	}
-	return true, nil
-}
-
-func (s *PostService) SharePost(postId, userId, platform string) (bool, error) {
-	if postId == "" || userId == "" {
-		return false, nil
-	}
-
-	query := elastic.NewBoolQuery().
-		Must(elastic.NewTermQuery("post_id", postId)).
-		MustNot(elastic.NewTermQuery("deleted", true))
-	searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
-	if err != nil {
-		return false, err
-	}
-	if len(getPostFromSearchResult(searchResult)) == 0 {
-		return false, ErrPostNotFound
-	}
-
-	shareId := fmt.Sprintf("%s_%s_%s_%d", postId, userId, platform, time.Now().Unix())
-	share := model.PostShare{
-		PostShareId: shareId,
-		UserId:      userId,
-		PostId:      postId,
-		CreatedAt:   time.Now().Unix(),
-		Platform:    platform,
-	}
-	if err := s.es.SaveToES(&share, constants.SHARE_INDEX, share.PostShareId); err != nil {
-		return false, err
-	}
-	if err := s.Counters.Incr(context.Background(), postId, "shared_count", 1); err != nil {
-		if !errors.Is(err, counter.ErrNotRecorded) {
-			log.Printf("share counter: %v", err)
-		} else if err := s.es.IncrementFieldInES(constants.POST_INDEX, postId, "shared_count", 1); err != nil {
-			return false, err
-		}
-	}
-	return true, nil
-}
-
-// CleanupDeletedPosts processes up to `limit` posts marked for cleanup.
-func (s *PostService) CleanupDeletedPosts(limit int) (bool, error) {
-	query := elastic.NewBoolQuery().Must(
-		elastic.NewTermQuery("deleted", true),
-		elastic.NewTermQuery("cleanup_status", "pending"),
-	)
-	searchResult, err := s.es.ReadFromES(query, constants.POST_INDEX)
-	if err != nil {
-		return false, err
-	}
-	posts := getDeletedPostFromSearchResult(searchResult)
-	if len(posts) == 0 {
-		return false, nil
-	}
-	if limit <= 0 || limit > len(posts) {
-		limit = len(posts)
-	}
-	for i := 0; i < limit; i++ {
-		post := posts[i]
-		fields := map[string]interface{}{"cleanup_status": "completed", "last_error": ""}
-		if err := s.gcs.DeleteFromGCS(post.PostId); err != nil {
-			retries := post.RetryCount + 1
-			status := "pending"
-			if retries >= 5 {
-				status = "failed"
-			}
-			fields = map[string]interface{}{"cleanup_status": status, "retry_count": retries, "last_error": err.Error()}
-		}
-		if err := s.es.UpdateFieldsInES(constants.POST_INDEX, post.PostId, fields); err != nil {
-			return false, err
-		}
-	}
-	return true, nil
-}
-
-// AddComment adds a comment (or reply) to a post.
-func (s *PostService) AddComment(postId, parentCommentId, userId, content string) (string, error) {
-	if postId == "" || userId == "" || content == "" {
-		return "", fmt.Errorf("postId, userId, and content are required")
-	}
-
-	// Verify the post exists.
-	postQuery := elastic.NewBoolQuery().
-		Must(elastic.NewTermQuery("post_id", postId)).
-		MustNot(elastic.NewTermQuery("deleted", true))
-	postResult, err := s.es.ReadFromES(postQuery, constants.POST_INDEX)
-	if err != nil {
-		return "", err
-	}
-	if len(getPostFromSearchResult(postResult)) == 0 {
-		return "", ErrPostNotFound
-	}
-
-	commentId := uuid.New().String()
-	now := time.Now().Unix()
-	rootCommentId := commentId
-	depth := 0
-
-	if parentCommentId != "" {
-		parentQuery := elastic.NewBoolQuery().
-			Must(elastic.NewTermQuery("comment_id", parentCommentId)).
-			MustNot(elastic.NewTermQuery("deleted", true))
-		parentResult, err := s.es.ReadFromES(parentQuery, constants.COMMENT_INDEX)
-		if err != nil {
-			return "", err
-		}
-		parents := getCommentFromSearchResult(parentResult)
-		if len(parents) == 0 {
-			return "", ErrCommentNotFound
-		}
-		parent := parents[0]
-		if parent.PostId != postId {
-			return "", fmt.Errorf("parent comment does not belong to this post")
-		}
-		rootCommentId = parent.RootCommentId
-		if rootCommentId == "" {
-			rootCommentId = parent.CommentId
-		}
-		depth = parent.Depth + 1
-	}
-
-	comment := model.Comment{
-		CommentId:       commentId,
-		ParentCommentId: parentCommentId,
-		RootCommentId:   rootCommentId,
-		UserId:          userId,
-		PostId:          postId,
-		Depth:           depth,
-		Content:         content,
-		CreatedAt:       now,
-		Deleted:         false,
-		DeletedAt:       0,
-	}
-	if err := s.es.SaveToES(comment, constants.COMMENT_INDEX, comment.CommentId); err != nil {
-		return "", err
-	}
-	return commentId, nil
 }
 
 func (s *PostService) GenerateImageFromOpenAIAndSavePost(ctx context.Context, userId, prompt string) (*model.Post, error) {
@@ -460,16 +252,200 @@ func (s *PostService) GenerateImageFromOpenAIAndSavePost(ctx context.Context, us
 	}
 	post.Url = mediaLink
 
-	if embedding, err := s.openai.GetEmbedding(ctx, prompt); err == nil {
-		post.Embedding = embedding
-	} else {
-		fmt.Printf("WARNING: embedding generation failed, post saved without vector: %v\n", err)
-	}
-
-	// Same path as uploads, so generated posts also reach followers' feeds (they were never
-	// published to Kafka before).
 	if err := s.persistNewPost(ctx, post); err != nil {
 		return nil, err
 	}
 	return post, nil
+}
+
+// ──────────────────────────── delete ────────────────────────────
+
+// DeletePost soft-deletes a post (only its author may) and records post.deleted in the same
+// transaction, so the search index is told exactly when the delete commits. The media file
+// is removed later by CleanupDeletedPosts.
+func (s *PostService) DeletePost(ctx context.Context, postId, userId string) (bool, error) {
+	if postId == "" || userId == "" {
+		return false, nil
+	}
+	var rec outbox.Record
+	err := db.InTx(ctx, s.db, func(tx pgx.Tx) error {
+		var owner string
+		var deletedAt *time.Time
+		// FOR UPDATE: two concurrent deletes of one post serialise here, and the second
+		// sees it already deleted instead of recording a second event.
+		err := tx.QueryRow(ctx, `SELECT user_id, deleted_at FROM posts WHERE post_id = $1 FOR UPDATE`, postId).Scan(&owner, &deletedAt)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && deletedAt != nil) {
+			return ErrPostNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if owner != userId {
+			return ErrNotPostOwner
+		}
+		now := s.now()
+		// Only the columns that change: counters are not rewritten (no lost update).
+		if _, err := tx.Exec(ctx, `
+			UPDATE posts SET deleted_at = $2, cleanup_status = 'pending', cleanup_attempts = 0,
+			                 cleanup_error = '', version = version + 1
+			WHERE post_id = $1`, postId, now); err != nil {
+			return err
+		}
+		rec, err = outbox.Enqueue(ctx, tx, outbox.Event{
+			AggregateType: "post", AggregateID: postId,
+			Topic: model.TopicPostDeleted, Key: owner,
+			Payload: model.PostDeletedEvent{PostId: postId, UserId: owner, DeletedAt: now.Unix()},
+		}, now.Add(fastPathGrace))
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	_ = s.redis.Delete(ctx, utils.UserFeedCacheKey(userId))
+	s.publishAfterCommit(ctx, rec)
+	return true, nil
+}
+
+// CleanupDeletedPosts removes the media of up to limit deleted posts. Each post is claimed
+// with FOR UPDATE SKIP LOCKED, so every post-service instance can run this loop without two
+// of them working on the same post. Returns how many posts were processed.
+func (s *PostService) CleanupDeletedPosts(ctx context.Context, limit int) (int, error) {
+	done := 0
+	for done < limit {
+		claimed := false
+		err := db.InTx(ctx, s.db, func(tx pgx.Tx) error {
+			var id string
+			var attempts int
+			err := tx.QueryRow(ctx, `
+				SELECT post_id, cleanup_attempts FROM posts
+				WHERE cleanup_status = 'pending'
+				ORDER BY deleted_at
+				LIMIT 1
+				FOR UPDATE SKIP LOCKED`).Scan(&id, &attempts)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			claimed = true
+			if gcsErr := s.gcs.DeleteFromGCS(id); gcsErr != nil {
+				status := "pending"
+				if attempts+1 >= 5 {
+					status = "failed" // needs an operator; stays visible in the table
+				}
+				_, err = tx.Exec(ctx, `
+					UPDATE posts SET cleanup_status = $2, cleanup_attempts = cleanup_attempts + 1, cleanup_error = $3
+					WHERE post_id = $1`, id, status, gcsErr.Error())
+				return err
+			}
+			_, err = tx.Exec(ctx, `UPDATE posts SET cleanup_status = 'completed', cleanup_error = '' WHERE post_id = $1`, id)
+			return err
+		})
+		if err != nil {
+			return done, err
+		}
+		if !claimed {
+			break
+		}
+		done++
+	}
+	return done, nil
+}
+
+// ──────────────────────────── likes and shares ────────────────────────────
+
+// LikePost records one like per user and post.
+//
+// The (post_id, user_id) primary key is the de-duplication: concurrent double taps race on
+// one INSERT ... ON CONFLICT DO NOTHING and exactly one inserts a row. The post.liked event
+// is written to the outbox in the same transaction, so a notification is no longer dropped
+// when Kafka is down. like_count goes through the write-behind counter, so a viral post costs
+// one row update per flush instead of a row lock per like.
+func (s *PostService) LikePost(ctx context.Context, postId, userId string) (bool, error) {
+	if postId == "" || userId == "" {
+		return false, nil
+	}
+	var rec outbox.Record
+	err := db.InTx(ctx, s.db, func(tx pgx.Tx) error {
+		owner, err := postOwner(ctx, tx, postId)
+		if err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO post_likes (post_id, user_id) VALUES ($1, $2)
+			ON CONFLICT (post_id, user_id) DO NOTHING`, postId, userId)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrAlreadyLiked
+		}
+		now := s.now()
+		rec, err = outbox.Enqueue(ctx, tx, outbox.Event{
+			AggregateType: "post", AggregateID: postId,
+			Topic: model.TopicPostLiked, Key: postId,
+			Payload: model.PostLikedEvent{PostId: postId, LikerId: userId, OwnerId: owner, CreatedAt: now.Unix()},
+		}, now.Add(fastPathGrace))
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	if err := s.bumpCounter(ctx, postId, "like_count", 1); err != nil {
+		// The like is committed; the reconciler repairs the count from post_likes.
+		log.Printf("like %s/%s stored, count not updated: %v", postId, userId, err)
+	}
+	s.publishAfterCommit(ctx, rec)
+	return true, nil
+}
+
+// UnlikePost removes the caller's like. Returns ErrNotLiked if there was none.
+func (s *PostService) UnlikePost(ctx context.Context, postId, userId string) error {
+	tag, err := s.db.Exec(ctx, `DELETE FROM post_likes WHERE post_id = $1 AND user_id = $2`, postId, userId)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotLiked
+	}
+	if err := s.bumpCounter(ctx, postId, "like_count", -1); err != nil {
+		log.Printf("unlike %s/%s stored, count not updated: %v", postId, userId, err)
+	}
+	return nil
+}
+
+func (s *PostService) SharePost(ctx context.Context, postId, userId, platform string) (bool, error) {
+	if postId == "" || userId == "" {
+		return false, nil
+	}
+	tag, err := s.db.Exec(ctx, `
+		INSERT INTO post_shares (share_id, post_id, user_id, platform)
+		SELECT $1, $2, $3, $4
+		WHERE EXISTS (SELECT 1 FROM posts WHERE post_id = $2 AND deleted_at IS NULL)`,
+		uuid.New().String(), postId, userId, platform)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, ErrPostNotFound
+	}
+	if err := s.bumpCounter(ctx, postId, "shared_count", 1); err != nil {
+		log.Printf("share of %s stored, count not updated: %v", postId, err)
+	}
+	return true, nil
+}
+
+// bumpCounter records a counter change in Redis (flushed in batches); if Redis did not take
+// it, it writes the row directly. Never both: that would count the change twice.
+func (s *PostService) bumpCounter(ctx context.Context, postId, field string, n int64) error {
+	err := s.Counters.Incr(ctx, postId, field, n)
+	if errors.Is(err, counter.ErrNotRecorded) {
+		return pgCounterSink{db: s.db}.Add(ctx, postId, field, n)
+	}
+	if err != nil {
+		// Recorded in Redis but not scheduled; the next increment of this post flushes it.
+		log.Printf("counter %s/%s: %v", postId, field, err)
+	}
+	return nil
 }

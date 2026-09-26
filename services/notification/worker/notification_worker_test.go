@@ -1,60 +1,76 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
+	"socialai/shared/db/dbtest"
 	"socialai/shared/model"
-	"socialai/shared/testutil"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func newTestNotificationWorker() (*NotificationWorker, *testutil.MockESBackend) {
-	es := testutil.NewMockESBackend()
-	w := NewNotificationWorker(es)
-	return w, es
+func newTestNotificationWorker(t *testing.T) (*NotificationWorker, *pgxpool.Pool) {
+	pool := dbtest.New(t)
+	return NewNotificationWorker(pool), pool
+}
+
+func count(t *testing.T, pool *pgxpool.Pool) int {
+	var n int
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT count(*) FROM notifications`).Scan(&n))
+	return n
 }
 
 func TestHandlePostLiked_CreatesNotification(t *testing.T) {
-	w, es := newTestNotificationWorker()
+	w, pool := newTestNotificationWorker(t)
+	payload, _ := json.Marshal(model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "bob", CreatedAt: 12345})
 
-	event := model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "bob", CreatedAt: 12345}
-	payload, _ := json.Marshal(event)
+	require.NoError(t, w.HandlePostLiked(context.Background(), payload))
+	assert.Equal(t, 1, count(t, pool))
 
-	err := w.HandlePostLiked("p1", payload)
+	var userID, actor string
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT user_id, actor_id FROM notifications`).Scan(&userID, &actor))
+	assert.Equal(t, "bob", userID)
+	assert.Equal(t, "alice", actor)
+}
+
+// Redelivery must not notify twice, and must not flip a read notification back to unread.
+func TestHandlePostLiked_RedeliveryIsANoOp(t *testing.T) {
+	w, pool := newTestNotificationWorker(t)
+	ctx := context.Background()
+	payload, _ := json.Marshal(model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "bob"})
+	require.NoError(t, w.HandlePostLiked(ctx, payload))
+	_, err := pool.Exec(ctx, `UPDATE notifications SET read = true`)
 	require.NoError(t, err)
-	assert.Len(t, es.Docs["notification"], 1, "should create one notification")
+
+	require.NoError(t, w.HandlePostLiked(ctx, payload))
+	assert.Equal(t, 1, count(t, pool))
+	var read bool
+	require.NoError(t, pool.QueryRow(ctx, `SELECT read FROM notifications`).Scan(&read))
+	assert.True(t, read)
 }
 
 func TestHandlePostLiked_SelfLike_NoNotification(t *testing.T) {
-	w, es := newTestNotificationWorker()
+	w, pool := newTestNotificationWorker(t)
+	payload, _ := json.Marshal(model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "alice"})
 
-	event := model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "alice"}
-	payload, _ := json.Marshal(event)
-
-	err := w.HandlePostLiked("p1", payload)
-	require.NoError(t, err)
-	assert.Empty(t, es.Docs["notification"], "self-like should not create notification")
+	require.NoError(t, w.HandlePostLiked(context.Background(), payload))
+	assert.Zero(t, count(t, pool), "self-like should not create notification")
 }
 
 func TestHandlePostLiked_InvalidJSON(t *testing.T) {
-	w, _ := newTestNotificationWorker()
-
-	err := w.HandlePostLiked("key", []byte("{invalid"))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "unmarshal")
+	w, _ := newTestNotificationWorker(t)
+	err := w.HandlePostLiked(context.Background(), []byte("{invalid"))
+	assert.ErrorContains(t, err, "unmarshal")
 }
 
-func TestHandlePostLiked_ESFails(t *testing.T) {
-	w, es := newTestNotificationWorker()
-	es.SaveErr = assert.AnError
-
-	event := model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "bob"}
-	payload, _ := json.Marshal(event)
-
-	err := w.HandlePostLiked("p1", payload)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "save notification")
+func TestHandlePostLiked_DBFails(t *testing.T) {
+	w, pool := newTestNotificationWorker(t)
+	pool.Close() // every query now fails
+	payload, _ := json.Marshal(model.PostLikedEvent{PostId: "p1", LikerId: "alice", OwnerId: "bob"})
+	assert.ErrorContains(t, w.HandlePostLiked(context.Background(), payload), "save notification",
+		"the error goes back to the consumer, which retries and then dead-letters")
 }

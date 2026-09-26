@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"socialai/services/post/service"
+	"socialai/shared/db/dbtest"
 	"socialai/shared/idempotency"
 	"socialai/shared/testutil"
 
@@ -37,9 +38,21 @@ func uploadRequest(t *testing.T, key, caption string) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), "user", token))
 }
 
+// newTestService returns a PostService on a fresh database and a function counting its posts.
+func newTestService(t *testing.T, redis *testutil.MockRedisBackend) (*service.PostService, func() int) {
+	pool := dbtest.New(t)
+	svc := service.NewPostService(pool, testutil.NewMockESBackend(), redis, testutil.NewMockGCSBackend(), testutil.NewMockOpenAIBackend(), testutil.NewMockKafkaProducer())
+	return svc, func() int {
+		var n int
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM posts`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+}
+
 func TestUploadRetryWithSameKeyCreatesOnePost(t *testing.T) {
-	es := testutil.NewMockESBackend()
-	svc := service.NewPostService(es, testutil.NewMockRedisBackend(), testutil.NewMockGCSBackend(), testutil.NewMockOpenAIBackend(), testutil.NewMockKafkaProducer())
+	svc, posts := newTestService(t, testutil.NewMockRedisBackend())
 	h := NewPostHandler(svc)
 
 	first := httptest.NewRecorder()
@@ -60,7 +73,7 @@ func TestUploadRetryWithSameKeyCreatesOnePost(t *testing.T) {
 	if a["post_id"] == "" || a["post_id"] != b["post_id"] {
 		t.Fatalf("retry returned a different post: %v vs %v", a, b)
 	}
-	if n := len(es.Docs["post"]); n != 1 {
+	if n := posts(); n != 1 {
 		t.Fatalf("%d posts stored, want 1", n)
 	}
 
@@ -72,7 +85,7 @@ func TestUploadRetryWithSameKeyCreatesOnePost(t *testing.T) {
 }
 
 func TestUploadWithoutKeyStillWorks(t *testing.T) {
-	svc := service.NewPostService(testutil.NewMockESBackend(), testutil.NewMockRedisBackend(), testutil.NewMockGCSBackend(), testutil.NewMockOpenAIBackend(), testutil.NewMockKafkaProducer())
+	svc, _ := newTestService(t, testutil.NewMockRedisBackend())
 	rec := httptest.NewRecorder()
 	NewPostHandler(svc).uploadPostHandler(rec, uploadRequest(t, "", "sunset"))
 	if rec.Code != http.StatusCreated {
@@ -112,9 +125,8 @@ func (c ctxRedis) Delete(ctx context.Context, keys ...string) error {
 // request context is cancelled) after the post was saved, then retries. The retry must get
 // the stored response, not 409 and not a second post.
 func TestUploadClientDisconnectThenRetryReplays(t *testing.T) {
-	es := testutil.NewMockESBackend()
 	redis := testutil.NewMockRedisBackend()
-	svc := service.NewPostService(es, redis, testutil.NewMockGCSBackend(), testutil.NewMockOpenAIBackend(), testutil.NewMockKafkaProducer())
+	svc, posts := newTestService(t, redis)
 	svc.Idempotency = &idempotency.Store{KV: ctxRedis{redis}}
 	h := NewPostHandler(svc)
 
@@ -128,7 +140,7 @@ func TestUploadClientDisconnectThenRetryReplays(t *testing.T) {
 	if retry.Code != http.StatusCreated || retry.Header().Get("Idempotent-Replayed") != "true" {
 		t.Fatalf("retry after disconnect: %d %s, want replayed 201", retry.Code, retry.Body.String())
 	}
-	if n := len(es.Docs["post"]); n != 1 {
+	if n := posts(); n != 1 {
 		t.Fatalf("%d posts stored, want 1", n)
 	}
 }

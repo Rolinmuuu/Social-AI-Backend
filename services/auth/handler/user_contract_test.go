@@ -2,12 +2,13 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"socialai/shared/testutil"
+	"socialai/shared/db/dbtest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,15 +16,14 @@ import (
 
 var testJWTSecret = []byte("test-secret-for-unit-tests")
 
-func newTestAuthRouter() http.Handler {
-	es := testutil.NewMockESBackend()
-	return InitRouter(es, testJWTSecret)
+func newTestAuthRouter(t *testing.T) http.Handler {
+	return InitRouter(dbtest.New(t), testJWTSecret)
 }
 
 // ──────────────────── Contract: POST /signup ────────────────────
 
 func TestSignup_Contract_201(t *testing.T) {
-	router := newTestAuthRouter()
+	router := newTestAuthRouter(t)
 
 	body, _ := json.Marshal(map[string]string{"user_id": "testuser", "password": "pass123"})
 	req := httptest.NewRequest("POST", "/signup", bytes.NewReader(body))
@@ -39,7 +39,7 @@ func TestSignup_Contract_201(t *testing.T) {
 }
 
 func TestSignup_Contract_400_MissingFields(t *testing.T) {
-	router := newTestAuthRouter()
+	router := newTestAuthRouter(t)
 
 	body, _ := json.Marshal(map[string]string{"user_id": ""})
 	req := httptest.NewRequest("POST", "/signup", bytes.NewReader(body))
@@ -52,7 +52,7 @@ func TestSignup_Contract_400_MissingFields(t *testing.T) {
 }
 
 func TestSignup_Contract_400_InvalidUserId(t *testing.T) {
-	router := newTestAuthRouter()
+	router := newTestAuthRouter(t)
 
 	body, _ := json.Marshal(map[string]string{"user_id": "UPPER_CASE!", "password": "pass123"})
 	req := httptest.NewRequest("POST", "/signup", bytes.NewReader(body))
@@ -65,9 +65,10 @@ func TestSignup_Contract_400_InvalidUserId(t *testing.T) {
 }
 
 func TestSignup_Contract_409_Duplicate(t *testing.T) {
-	es := testutil.NewMockESBackend()
-	es.SetDoc("user", "alice", map[string]string{"user_id": "alice"})
-	router := InitRouter(es, testJWTSecret)
+	pool := dbtest.New(t)
+	_, err := pool.Exec(context.Background(), `INSERT INTO users (user_id, password_hash) VALUES ('alice', 'x')`)
+	require.NoError(t, err)
+	router := InitRouter(pool, testJWTSecret)
 
 	body, _ := json.Marshal(map[string]string{"user_id": "alice", "password": "pass123"})
 	req := httptest.NewRequest("POST", "/signup", bytes.NewReader(body))
@@ -82,7 +83,7 @@ func TestSignup_Contract_409_Duplicate(t *testing.T) {
 // ──────────────────── Contract: POST /signin ────────────────────
 
 func TestSignin_Contract_401_WrongPassword(t *testing.T) {
-	router := newTestAuthRouter()
+	router := newTestAuthRouter(t)
 
 	body, _ := json.Marshal(map[string]string{"user_id": "nobody", "password": "wrong"})
 	req := httptest.NewRequest("POST", "/signin", bytes.NewReader(body))
@@ -97,7 +98,7 @@ func TestSignin_Contract_401_WrongPassword(t *testing.T) {
 // ──────────────────── Contract: GET /health ────────────────────
 
 func TestHealth_Contract_200(t *testing.T) {
-	router := newTestAuthRouter()
+	router := newTestAuthRouter(t)
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()

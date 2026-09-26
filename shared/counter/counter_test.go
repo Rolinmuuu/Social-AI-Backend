@@ -59,18 +59,18 @@ func (r *memRedis) GetDel(_ context.Context, k string) (string, error) {
 	return strconv.FormatInt(v, 10), nil
 }
 
-type esSink struct {
+type memSink struct {
 	mu     sync.Mutex
 	writes int
-	counts map[string]int
+	counts map[string]int64
 	fail   bool
 }
 
-func (s *esSink) IncrementFieldInES(_ string, id, field string, v int) error {
+func (s *memSink) Add(_ context.Context, id, field string, v int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail {
-		return errors.New("version_conflict_engine_exception")
+		return errors.New("database unavailable")
 	}
 	s.writes++
 	s.counts[id+"/"+field] += v
@@ -78,8 +78,8 @@ func (s *esSink) IncrementFieldInES(_ string, id, field string, v int) error {
 }
 
 func TestThousandConcurrentLikesBecomeOneWrite(t *testing.T) {
-	r, es := newRedis(), &esSink{counts: map[string]int{}}
-	c := &Counter{Store: r, Sink: es, Index: "post"}
+	r, sink := newRedis(), &memSink{counts: map[string]int64{}}
+	c := &Counter{Store: r, Sink: sink}
 	var wg sync.WaitGroup
 	for i := 0; i < 1000; i++ {
 		wg.Add(1)
@@ -95,26 +95,26 @@ func TestThousandConcurrentLikesBecomeOneWrite(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("flush wrote %d docs, err %v", n, err)
 	}
-	if es.writes != 1 || es.counts["hot-post/like_count"] != 1000 {
-		t.Fatalf("ES writes=%d count=%d, want 1 write of +1000", es.writes, es.counts["hot-post/like_count"])
+	if sink.writes != 1 || sink.counts["hot-post/like_count"] != 1000 {
+		t.Fatalf("sink writes=%d count=%d, want 1 write of +1000", sink.writes, sink.counts["hot-post/like_count"])
 	}
 }
 
 func TestFailedFlushKeepsTheDelta(t *testing.T) {
-	r, es := newRedis(), &esSink{counts: map[string]int{}, fail: true}
-	c := &Counter{Store: r, Sink: es, Index: "post"}
+	r, sink := newRedis(), &memSink{counts: map[string]int64{}, fail: true}
+	c := &Counter{Store: r, Sink: sink}
 	for i := 0; i < 5; i++ {
 		_ = c.Incr(context.Background(), "p", "like_count", 1)
 	}
 	if _, err := c.Flush(context.Background(), 10); err == nil {
-		t.Fatal("want the ES error")
+		t.Fatal("want the sink error")
 	}
 	_ = c.Incr(context.Background(), "p", "like_count", 1) // a like during the outage
-	es.fail = false
+	sink.fail = false
 	if _, err := c.Flush(context.Background(), 10); err != nil {
 		t.Fatal(err)
 	}
-	if got := es.counts["p/like_count"]; got != 6 {
+	if got := sink.counts["p/like_count"]; got != 6 {
 		t.Fatalf("count = %d, want 6 (nothing lost)", got)
 	}
 }
@@ -148,22 +148,22 @@ func (r *ctxRedis) GetDel(ctx context.Context, k string) (string, error) {
 }
 
 // SIGTERM arrives while a flush is running: the entries it already took out of the dirty set
-// must still reach ES.
+// must still reach the database.
 type cancelOnWrite struct {
-	*esSink
+	*memSink
 	cancel context.CancelFunc
 }
 
-func (s *cancelOnWrite) IncrementFieldInES(i, id, f string, v int) error {
+func (s *cancelOnWrite) Add(ctx context.Context, id, f string, v int64) error {
 	s.cancel()
-	return s.esSink.IncrementFieldInES(i, id, f, v)
+	return s.memSink.Add(ctx, id, f, v)
 }
 
 func TestShutdownDuringFlushLosesNothing(t *testing.T) {
 	r := &ctxRedis{memRedis: newRedis()}
 	ctx, cancel := context.WithCancel(context.Background())
-	es := &cancelOnWrite{esSink: &esSink{counts: map[string]int{}}, cancel: cancel}
-	c := &Counter{Store: r, Sink: es, Index: "post"}
+	sink := &cancelOnWrite{memSink: &memSink{counts: map[string]int64{}}, cancel: cancel}
+	c := &Counter{Store: r, Sink: sink}
 	for _, id := range []string{"a", "b", "c"} {
 		_ = c.Incr(context.Background(), id, "like_count", 2)
 	}
@@ -171,7 +171,7 @@ func TestShutdownDuringFlushLosesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"a", "b", "c"} {
-		if got := es.counts[id+"/like_count"]; got != 2 {
+		if got := sink.counts[id+"/like_count"]; got != 2 {
 			t.Fatalf("%s: count %d, want 2", id, got)
 		}
 	}
@@ -181,7 +181,7 @@ func TestShutdownDuringFlushLosesNothing(t *testing.T) {
 // caller's fallback write is the only one: no double count.
 func TestIncrThatCannotScheduleIsUndone(t *testing.T) {
 	r := &ctxRedis{memRedis: newRedis(), failSAdd: true}
-	c := &Counter{Store: r, Sink: &esSink{counts: map[string]int{}}, Index: "post"}
+	c := &Counter{Store: r, Sink: &memSink{counts: map[string]int64{}}}
 	err := c.Incr(context.Background(), "p", "like_count", 1)
 	if !errors.Is(err, ErrNotRecorded) {
 		t.Fatalf("err = %v, want ErrNotRecorded", err)

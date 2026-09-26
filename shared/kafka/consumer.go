@@ -28,6 +28,21 @@ func NewKafkaConsumer(brokers []string, topic, groupID string) *KafkaConsumer {
 	}
 }
 
+// NewKafkaGroupConsumer consumes several topics in one consumer group (the search indexer
+// reads post.created and post.deleted).
+func NewKafkaGroupConsumer(brokers []string, topics []string, groupID string) *KafkaConsumer {
+	return &KafkaConsumer{
+		reader: kafka.NewReader(kafka.ReaderConfig{
+			Brokers:        brokers,
+			GroupTopics:    topics,
+			GroupID:        groupID,
+			MinBytes:       1,
+			MaxBytes:       10e6,
+			CommitInterval: 0,
+		}),
+	}
+}
+
 // Fetch returns the next message without committing it.
 func (c *KafkaConsumer) Fetch(ctx context.Context) (consumer.Message, error) {
 	m, err := c.reader.FetchMessage(ctx)

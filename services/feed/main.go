@@ -7,15 +7,18 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"socialai/services/feed/worker"
 	sharedBackend "socialai/shared/backend"
 	"socialai/shared/constants"
 	"socialai/shared/consumer"
+	"socialai/shared/db"
 	"socialai/shared/kafka"
 	"socialai/shared/logger"
 	"socialai/shared/metrics"
 	"socialai/shared/model"
+	"socialai/shared/socialgraph"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -25,17 +28,18 @@ func main() {
 	logger.InitLogger(constants.LOGSTASH_ADDRESS)
 	defer logger.Logger.Sync()
 
-	esBackend, err := sharedBackend.InitElasticsearchBackend()
+	pool, err := db.Open(context.Background(), constants.DATABASE_URL, 60*time.Second)
 	if err != nil {
-		log.Fatalf("ES init failed: %v", err)
+		log.Fatalf("PostgreSQL init failed: %v", err)
 	}
+	defer pool.Close()
 
 	redisBackend, err := sharedBackend.InitRedisBackend()
 	if err != nil {
 		log.Fatalf("Redis init failed: %v", err)
 	}
 
-	feedWorker := worker.NewFeedWorker(esBackend, redisBackend)
+	feedWorker := worker.NewFeedWorker(socialgraph.Graph{DB: pool}, redisBackend)
 
 	source := kafka.NewKafkaConsumer(constants.KAFKA_BROKERS, model.TopicPostCreated, "feed-worker-group")
 	defer source.Close()
@@ -66,8 +70,8 @@ func main() {
 	}
 
 	logger.Logger.Info("feed-worker starting", zap.Strings("brokers", constants.KAFKA_BROKERS))
-	err = c.Run(ctx, func(_ context.Context, m consumer.Message) error {
-		return feedWorker.HandlePostCreated(string(m.Key), m.Value)
+	err = c.Run(ctx, func(ctx context.Context, m consumer.Message) error {
+		return feedWorker.HandlePostCreated(ctx, m.Value)
 	})
 	if err != nil {
 		logger.Logger.Error("feed-worker stopped", zap.Error(err))

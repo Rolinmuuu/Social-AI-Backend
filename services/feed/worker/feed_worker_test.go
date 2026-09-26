@@ -1,100 +1,108 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
 	"socialai/shared/backend"
+	"socialai/shared/db/dbtest"
 	"socialai/shared/feedplan"
 	"socialai/shared/model"
+	"socialai/shared/socialgraph"
 	"socialai/shared/testutil"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func newTestFeedWorker() (*FeedWorker, *testutil.MockESBackend, *testutil.MockRedisBackend) {
-	es := testutil.NewMockESBackend()
+var ctx = context.Background()
+
+// The worker runs on the real follow graph in PostgreSQL.
+func newTestFeedWorker(t *testing.T) (*FeedWorker, *pgxpool.Pool, *testutil.MockRedisBackend) {
+	pool := dbtest.New(t)
 	redis := testutil.NewMockRedisBackend()
-	w := NewFeedWorker(es, redis)
-	return w, es, redis
+	return NewFeedWorker(socialgraph.Graph{DB: pool}, redis), pool, redis
+}
+
+func followers(t *testing.T, pool *pgxpool.Pool, author string, n int) {
+	_, err := pool.Exec(ctx, `
+		INSERT INTO follows (follower_id, followee_id)
+		SELECT 'fan' || i, $1 FROM generate_series(0, $2 - 1) i`, author, n)
+	require.NoError(t, err)
+}
+
+func event(post, author string) []byte {
+	b, _ := json.Marshal(model.PostCreatedEvent{PostId: post, UserId: author, CreatedAt: 100})
+	return b
 }
 
 func TestHandlePostCreated_FanOutToFollowers(t *testing.T) {
-	w, es, redis := newTestFeedWorker()
+	w, pool, redis := newTestFeedWorker(t)
+	followers(t, pool, "author1", 2)
 
-	es.SetDoc("follow", "f1", model.Follow{FollowId: "f1", FollowerId: "follower_a", FolloweeId: "author1"})
-	es.SetDoc("follow", "f2", model.Follow{FollowId: "f2", FollowerId: "follower_b", FolloweeId: "author1"})
-
-	event := model.PostCreatedEvent{
-		PostId: "p1", UserId: "author1", Message: "hello", Url: "http://img.png", Type: "image",
-	}
-	payload, _ := json.Marshal(event)
-
-	err := w.HandlePostCreated("author1", payload)
-	require.NoError(t, err)
-
-	assert.Equal(t, []string{"p1"}, redis.Feed("follower_a"))
-	assert.Equal(t, []string{"p1"}, redis.Feed("follower_b"))
+	require.NoError(t, w.HandlePostCreated(ctx, event("p1", "author1")))
+	assert.Equal(t, []string{"p1"}, redis.Feed("fan0"))
+	assert.Equal(t, []string{"p1"}, redis.Feed("fan1"))
 }
 
 func TestHandlePostCreated_RedeliveryIsIdempotent(t *testing.T) {
-	w, es, redis := newTestFeedWorker()
-	es.SetDoc("follow", "f1", model.Follow{FollowId: "f1", FollowerId: "fan", FolloweeId: "author1"})
-	payload, _ := json.Marshal(model.PostCreatedEvent{PostId: "p1", UserId: "author1", CreatedAt: 100})
+	w, pool, redis := newTestFeedWorker(t)
+	followers(t, pool, "author1", 1)
 
 	// At-least-once delivery: the same event can arrive twice (outbox retry, consumer restart).
-	require.NoError(t, w.HandlePostCreated("author1", payload))
-	require.NoError(t, w.HandlePostCreated("author1", payload))
-
-	assert.Equal(t, []string{"p1"}, redis.Feed("fan"), "a duplicate event must not duplicate the feed entry")
+	require.NoError(t, w.HandlePostCreated(ctx, event("p1", "author1")))
+	require.NoError(t, w.HandlePostCreated(ctx, event("p1", "author1")))
+	assert.Equal(t, []string{"p1"}, redis.Feed("fan0"), "a duplicate event must not duplicate the feed entry")
 }
 
+// 2,500 followers: read from PostgreSQL in pages, written in batches of 100.
 func TestHandlePostCreated_BatchesFollowerWrites(t *testing.T) {
-	w, es, redis := newTestFeedWorker()
+	w, pool, redis := newTestFeedWorker(t)
 	w.Policy = feedplan.Policy{BatchSize: 100, CelebrityThreshold: 10000}
-	for i := 0; i < 250; i++ {
-		id := fmt.Sprintf("f%d", i)
-		es.SetDoc("follow", id, model.Follow{FollowId: id, FollowerId: "fan" + id, FolloweeId: "author1"})
-	}
-	payload, _ := json.Marshal(model.PostCreatedEvent{PostId: "p1", UserId: "author1", CreatedAt: 100})
-	require.NoError(t, w.HandlePostCreated("author1", payload))
+	followers(t, pool, "author1", 2500)
 
-	assert.Equal(t, 3, redis.PipelineCalls, "250 followers in batches of 100 = 3 round trips")
-	assert.Equal(t, []string{"p1"}, redis.Feed("fanf249"))
+	require.NoError(t, w.HandlePostCreated(ctx, event("p1", "author1")))
+	assert.Equal(t, 25, redis.PipelineCalls, "2,500 followers in batches of 100 = 25 round trips")
+	assert.Equal(t, []string{"p1"}, redis.Feed("fan2499"))
+	assert.Equal(t, []string{"p1"}, redis.Feed("fan0"))
 }
 
 func TestHandlePostCreated_CelebrityIsPulledNotPushed(t *testing.T) {
-	w, es, redis := newTestFeedWorker()
+	w, pool, redis := newTestFeedWorker(t)
 	w.Policy = feedplan.Policy{CelebrityThreshold: 3}
-	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("f%d", i)
-		es.SetDoc("follow", id, model.Follow{FollowId: id, FollowerId: "fan" + id, FolloweeId: "star"})
-	}
-	payload, _ := json.Marshal(model.PostCreatedEvent{PostId: "p1", UserId: "star", CreatedAt: 100})
-	require.NoError(t, w.HandlePostCreated("star", payload))
+	followers(t, pool, "star", 5)
 
+	require.NoError(t, w.HandlePostCreated(ctx, event("p1", "star")))
 	assert.Equal(t, 0, redis.PipelineCalls, "no fan-out writes for a pull-mode author")
 	assert.True(t, redis.IsMember(backend.CelebritySetKey, "star"))
 }
 
 func TestHandlePostCreated_NoFollowers(t *testing.T) {
-	w, _, redis := newTestFeedWorker()
-
-	event := model.PostCreatedEvent{PostId: "p1", UserId: "loner"}
-	payload, _ := json.Marshal(event)
-
-	err := w.HandlePostCreated("loner", payload)
-	require.NoError(t, err)
-	assert.Empty(t, redis.Feed("loner"))
+	w, _, redis := newTestFeedWorker(t)
+	require.NoError(t, w.HandlePostCreated(ctx, event("p1", "loner")))
 	assert.Equal(t, 0, redis.PipelineCalls)
 }
 
 func TestHandlePostCreated_InvalidJSON(t *testing.T) {
-	w, _, _ := newTestFeedWorker()
+	w, _, _ := newTestFeedWorker(t)
+	err := w.HandlePostCreated(ctx, []byte("not-json"))
+	assert.ErrorContains(t, err, "unmarshal")
+}
 
-	err := w.HandlePostCreated("key", []byte("not-json"))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "unmarshal")
+type brokenGraph struct{}
+
+func (brokenGraph) FollowerCountUpTo(context.Context, string, int) (int, error) {
+	return 0, errors.New("db down")
+}
+func (brokenGraph) AllFollowers(context.Context, string, int) ([]string, error) {
+	return nil, fmt.Errorf("unreachable")
+}
+
+func TestHandlePostCreated_DatabaseErrorIsRetried(t *testing.T) {
+	w := NewFeedWorker(brokenGraph{}, testutil.NewMockRedisBackend())
+	assert.ErrorContains(t, w.HandlePostCreated(ctx, event("p1", "a")), "count followers", "returned so the consumer retries")
 }

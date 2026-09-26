@@ -1,20 +1,22 @@
-// Package outbox implements the transactional-outbox relay used by post-service.
+// Package outbox implements the transactional outbox used by post-service.
 //
-// Problem it solves (the "dual write"): creating a post writes to Elasticsearch and then
+// Problem it solves (the "dual write"): creating a post writes to the database and then
 // publishes post.created to Kafka. Two independent systems cannot share a transaction, so
 // either write can fail after the other succeeded:
 //
-//   - ES ok, Kafka down  -> the post exists but followers never get it in their feed;
+//   - DB ok, Kafka down  -> the post exists but followers never get it in their feed;
 //   - returning an error for that case makes the client retry and create a duplicate post.
 //
-// The fix: the event is persisted *inside the same document write* as the post (a single
-// Elasticsearch document write is atomic), marked outbox_status="pending". Publishing then
-// happens asynchronously, and a relay keeps retrying pending records until the broker
-// accepts them. Delivery is at-least-once, so every consumer must be idempotent (the feed
-// worker writes with ZADD keyed by post id, which is).
+// The fix: the event is inserted into the outbox table in the *same PostgreSQL transaction*
+// as the change it describes (Enqueue), so both commit or neither does. Publishing then
+// happens asynchronously: right after commit (PublishNow, the fast path) and, for anything
+// still pending, by a relay that keeps retrying until the broker accepts it. Delivery is
+// at-least-once, so every consumer must be idempotent (the feed worker writes with ZADD keyed
+// by post id, the search indexer writes with external versions, notifications have
+// deterministic ids).
 //
-// The package is storage- and broker-agnostic; the Elasticsearch store and the Kafka
-// producer are adapters that satisfy Store and Publisher.
+// Relay and Store are storage- and broker-agnostic; PGStore (pgstore.go) and the Kafka
+// producer are the adapters used in production.
 package outbox
 
 import (
@@ -27,13 +29,15 @@ import (
 
 // Record is one event waiting to be published.
 type Record struct {
-	ID       string      // outbox id, here the post id
+	ID       string      // outbox row id
 	Topic    string      // e.g. "post.created"
 	Key      string      // partition key; events with the same key keep their order
 	Payload  interface{} // marshalled by the Publisher
 	Attempts int         // failed publish attempts so far
 	// NextAttemptAt is the earliest time the relay may retry (zero = now).
 	NextAttemptAt time.Time
+	// CreatedAt is when the event was recorded (used for the publish-lag metric).
+	CreatedAt time.Time
 }
 
 // Store reads pending records and records the outcome of a publish.
@@ -222,6 +226,9 @@ func (r *Relay) Run(ctx context.Context, interval time.Duration, onErr func(erro
 type CreatedAt interface{ CreatedAtUnix() int64 }
 
 func ageSeconds(rec Record, now time.Time) (float64, bool) {
+	if !rec.CreatedAt.IsZero() {
+		return now.Sub(rec.CreatedAt).Seconds(), true
+	}
 	c, ok := rec.Payload.(CreatedAt)
 	if !ok || c.CreatedAtUnix() == 0 {
 		return 0, false

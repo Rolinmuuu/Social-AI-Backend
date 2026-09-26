@@ -1,108 +1,102 @@
 package service
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"time"
 
-	"socialai/shared/backend"
-	"socialai/shared/constants"
-	"socialai/shared/model"
+	"socialai/shared/pagecursor"
+	"socialai/shared/socialgraph"
 
-	"github.com/google/uuid"
-	elastic "github.com/olivere/elastic/v7"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// SocialService handles follow/follower relationships.
+// SocialService owns the follows table.
 type SocialService struct {
-	es backend.ElasticsearchBackendInterface
+	db    *pgxpool.Pool
+	graph socialgraph.Graph
 }
 
-func NewSocialService(es backend.ElasticsearchBackendInterface) *SocialService {
-	return &SocialService{es: es}
+func NewSocialService(pool *pgxpool.Pool) *SocialService {
+	return &SocialService{db: pool, graph: socialgraph.Graph{DB: pool}}
 }
 
-// AddFollow creates a follow relationship. Returns ErrAlreadyFollowing if it exists.
-func (s *SocialService) AddFollow(followerId, followeeId string) (string, error) {
+// FollowPage is one page of a follower or following list.
+type FollowPage struct {
+	IDs        []string
+	NextCursor string
+}
+
+// AddFollow creates a follow relationship. Returns ErrAlreadyFollowing if it exists and
+// ErrUserNotFound if followee has not signed up.
+//
+// The primary key (follower_id, followee_id) makes "follow" a single atomic insert. The
+// Elasticsearch version searched first and then indexed a document under a random id, so a
+// double click could store the relationship twice (and unfollow then removed only one).
+func (s *SocialService) AddFollow(ctx context.Context, followerId, followeeId string) (string, error) {
 	if followerId == followeeId {
 		return "", ErrCannotFollowSelf
 	}
-
-	existing := elastic.NewBoolQuery().
-		Filter(elastic.NewTermQuery("follower_id", followerId)).
-		Filter(elastic.NewTermQuery("followee_id", followeeId))
-	result, err := s.es.ReadFromES(existing, constants.FOLLOW_INDEX)
+	exists, err := s.graph.UserExists(ctx, followeeId)
 	if err != nil {
-		return "", fmt.Errorf("failed to check existing follow: %w", err)
+		return "", fmt.Errorf("failed to look up user: %w", err)
 	}
-	if result.TotalHits() > 0 {
-		return "", ErrAlreadyFollowing
+	if !exists {
+		return "", ErrUserNotFound
 	}
-
-	follow := model.Follow{
-		FollowId:   uuid.New().String(),
-		FollowerId: followerId,
-		FolloweeId: followeeId,
-		CreatedAt:  time.Now(),
-	}
-	if err := s.es.SaveToES(follow, constants.FOLLOW_INDEX, follow.FollowId); err != nil {
+	tag, err := s.db.Exec(ctx, `
+		INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2)
+		ON CONFLICT (follower_id, followee_id) DO NOTHING`, followerId, followeeId)
+	if err != nil {
 		return "", fmt.Errorf("failed to save follow: %w", err)
 	}
-	return follow.FollowId, nil
+	if tag.RowsAffected() == 0 {
+		return "", ErrAlreadyFollowing
+	}
+	return FollowID(followerId, followeeId), nil
 }
 
-// RemoveFollow deletes a follow relationship. Returns ErrNotFollowing if it doesn't exist.
-func (s *SocialService) RemoveFollow(followerId, followeeId string) error {
-	query := elastic.NewBoolQuery().
-		Filter(elastic.NewTermQuery("follower_id", followerId)).
-		Filter(elastic.NewTermQuery("followee_id", followeeId))
-	result, err := s.es.ReadFromES(query, constants.FOLLOW_INDEX)
-	if err != nil {
-		return fmt.Errorf("failed to find follow: %w", err)
-	}
-	if result.TotalHits() == 0 {
-		return ErrNotFollowing
-	}
+// FollowID is the public id of a relationship (its primary key).
+func FollowID(followerId, followeeId string) string { return followerId + ":" + followeeId }
 
-	followDocId := result.Hits.Hits[0].Id
-	if _, err := s.es.DeleteFromES(constants.FOLLOW_INDEX, followDocId); err != nil {
+// RemoveFollow deletes a follow relationship. Returns ErrNotFollowing if it doesn't exist.
+func (s *SocialService) RemoveFollow(ctx context.Context, followerId, followeeId string) error {
+	tag, err := s.db.Exec(ctx, `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`, followerId, followeeId)
+	if err != nil {
 		return fmt.Errorf("failed to delete follow: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFollowing
 	}
 	return nil
 }
 
-// GetFollowerIds returns the IDs of users who follow userId.
-func (s *SocialService) GetFollowerIds(userId string) ([]string, error) {
-	query := elastic.NewTermQuery("followee_id", userId)
-	result, err := s.es.ReadFromES(query, constants.FOLLOW_INDEX)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get followers: %w", err)
-	}
-
-	var ids []string
-	for _, hit := range result.Hits.Hits {
-		var follow model.Follow
-		if err := json.Unmarshal(hit.Source, &follow); err == nil {
-			ids = append(ids, follow.FollowerId)
-		}
-	}
-	return ids, nil
+// Followers returns one page of userId's followers, newest first.
+//
+// The Elasticsearch version sent no size, so it silently returned the first 10 followers
+// (the search default) to everyone, whatever the real count.
+func (s *SocialService) Followers(ctx context.Context, userId string, limit int, cursor string) (FollowPage, error) {
+	return s.list(ctx, s.graph.Followers, userId, limit, cursor)
 }
 
-// GetFollowingIds returns the IDs of users that userId follows.
-func (s *SocialService) GetFollowingIds(userId string) ([]string, error) {
-	query := elastic.NewTermQuery("follower_id", userId)
-	result, err := s.es.ReadFromES(query, constants.FOLLOW_INDEX)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get following: %w", err)
-	}
+// Following returns one page of the accounts userId follows, newest first.
+func (s *SocialService) Following(ctx context.Context, userId string, limit int, cursor string) (FollowPage, error) {
+	return s.list(ctx, s.graph.Following, userId, limit, cursor)
+}
 
-	var ids []string
-	for _, hit := range result.Hits.Hits {
-		var follow model.Follow
-		if err := json.Unmarshal(hit.Source, &follow); err == nil {
-			ids = append(ids, follow.FolloweeId)
-		}
+type lister func(ctx context.Context, userID string, after socialgraph.Cursor, limit int) (socialgraph.Page, error)
+
+func (s *SocialService) list(ctx context.Context, fn lister, userId string, limit int, cursor string) (FollowPage, error) {
+	var after socialgraph.Cursor
+	if err := pagecursor.Decode(cursor, &after); err != nil {
+		return FollowPage{}, err
 	}
-	return ids, nil
+	p, err := fn(ctx, userId, after, pagecursor.Limit(limit, 50, 200))
+	if err != nil {
+		return FollowPage{}, err
+	}
+	out := FollowPage{IDs: p.IDs}
+	if p.Next != nil {
+		out.NextCursor = pagecursor.Encode(p.Next)
+	}
+	return out, nil
 }

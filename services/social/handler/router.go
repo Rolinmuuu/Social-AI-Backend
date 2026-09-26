@@ -5,20 +5,20 @@ import (
 	"os"
 
 	"socialai/services/social/service"
-	sharedBackend "socialai/shared/backend"
 	"socialai/shared/middleware"
 
 	jwtMiddleware "github.com/auth0/go-jwt-middleware"
 	jwt "github.com/form3tech-oss/jwt-go"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func InitRouter(esBackend sharedBackend.ElasticsearchBackendInterface) http.Handler {
+func InitRouter(pool *pgxpool.Pool) http.Handler {
 	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
 
-	socialSvc := service.NewSocialService(esBackend)
+	socialSvc := service.NewSocialService(pool)
 	h := NewSocialHandler(socialSvc)
 
 	jwtAuth := jwtMiddleware.New(jwtMiddleware.Options{
@@ -41,12 +41,12 @@ func InitRouter(esBackend sharedBackend.ElasticsearchBackendInterface) http.Hand
 
 	// POST /follow   → follow a user (body: {"followee_id": "..."})
 	// DELETE /follow → unfollow a user (body: {"followee_id": "..."})
-	// GET /follow/followers → users who follow me
-	// GET /follow/following → users I follow
+	// GET /follow/followers?user_id=&limit=&cursor= → who follows user_id (default: me), paged
+	// GET /follow/following?user_id=&limit=&cursor= → whom user_id follows, paged
 	router.Handle("/follow", jwtAuth.Handler(http.HandlerFunc(h.addFollowHandler))).Methods("POST")
 	router.Handle("/follow", jwtAuth.Handler(http.HandlerFunc(h.removeFollowHandler))).Methods("DELETE")
-	router.Handle("/follow/followers", jwtAuth.Handler(http.HandlerFunc(h.getFollowersHandler))).Methods("GET")
-	router.Handle("/follow/following", jwtAuth.Handler(http.HandlerFunc(h.getFollowingHandler))).Methods("GET")
+	router.Handle("/follow/followers", jwtAuth.Handler(h.listHandler("follower_ids", socialSvc.Followers))).Methods("GET")
+	router.Handle("/follow/following", jwtAuth.Handler(h.listHandler("following_ids", socialSvc.Following))).Methods("GET")
 
 	origins := handlers.AllowedOrigins([]string{"*"})
 	methods := handlers.AllowedMethods([]string{"GET", "POST", "DELETE", "OPTIONS"})

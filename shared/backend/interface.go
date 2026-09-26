@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"time"
 
@@ -10,16 +11,16 @@ import (
 	"github.com/olivere/elastic/v7"
 )
 
+// ElasticsearchBackendInterface is the search side. Elasticsearch holds a projection of
+// posts built by the search indexer; it is never the source of truth for anything.
 type ElasticsearchBackendInterface interface {
-	ReadFromES(query elastic.Query, index string) (*elastic.SearchResult, error)
 	ReadFromESWithSize(query elastic.Query, index string, size int) (*elastic.SearchResult, error)
-	SaveToES(i interface{}, index string, id string) error
-	DeleteFromES(index string, id string) (bool, error)
-	IncrementFieldInES(index string, id string, field string, value int) error
-	KNNSearchFromES(index string, field string, vector []float32, k int) (*elastic.SearchResult, error)
-	SearchSorted(query elastic.Query, index, sortField string, ascending bool, size int) (*elastic.SearchResult, error)
-	CreateInES(i interface{}, index string, id string) (bool, error)
-	UpdateFieldsInES(index string, id string, fields map[string]interface{}) error
+	KNNSearchFromES(index string, field string, vector []float32, k int, filter elastic.Query) (*elastic.SearchResult, error)
+	// IndexVersioned writes with version_type=external; applied=false means the index
+	// already holds this version or a newer one.
+	IndexVersioned(index, id string, doc interface{}, version int64) (applied bool, err error)
+	// Scan visits every document of an index (used once, to migrate the legacy indices).
+	Scan(ctx context.Context, index string, fn func(id string, source json.RawMessage) error) error
 }
 
 type GoogleCloudStorageBackendInterface interface {

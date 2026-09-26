@@ -1,21 +1,20 @@
 // Package counter implements write-behind counters for like_count / shared_count.
 //
-// Bottleneck it removes: every like used to run an Elasticsearch update-by-script on the post
-// document. A popular post receives many likes per second on one document; ES serialises
-// updates per document with optimistic versioning, so concurrent updates conflict, retry and
-// eventually fail (the like is stored but the request returns 500). Here each like is an
-// atomic Redis INCRBY on a delta key plus SADD into a "dirty" set; a flusher periodically
-// takes the dirty posts, reads-and-clears each delta (GETDEL) and applies it to ES as one
-// update. N likes in a flush window become one ES write.
+// Bottleneck it removes: a like that also increments posts.like_count in the same transaction
+// makes every like on a popular post queue on that one row's lock (and, when the counts lived
+// in Elasticsearch, on its per-document version, where concurrent updates conflicted and
+// failed). Here each like is an atomic Redis INCRBY on a delta key plus SADD into a "dirty"
+// set; a flusher periodically takes the dirty posts, reads-and-clears each delta (GETDEL) and
+// applies it to the database as one UPDATE. N likes in a flush window become one row write.
 //
 // Trade-offs, stated honestly:
-//   - Counts in ES lag by up to one flush interval (seconds). Readers can add the pending delta
-//     if they need exact numbers.
+//   - Stored counts lag by up to one flush interval (seconds). Readers can add the pending
+//     delta if they need exact numbers.
 //   - If the process crashes after SPOP (the post leaves the dirty set) or after GETDEL but
-//     before the ES update, that delta is not applied. The like documents in the post_like
-//     index stay the source of truth, so the count can be recomputed from them (a reconcile
-//     job for this is not written yet). A failed ES or Redis call, the common case, loses
-//     nothing: the delta or the dirty marker is put back and the next flush retries.
+//     before the UPDATE, that delta is not applied. The post_likes / post_shares rows stay the
+//     source of truth and the reconciler in post-service recounts from them. A failed database
+//     or Redis call, the common case, loses nothing: the delta or the dirty marker is put back
+//     and the next flush retries.
 //   - Cancelling Flush's context (shutdown) stops it from taking new work, but entries it
 //     already popped are finished with a detached context, so a SIGTERM mid-flush does not
 //     strand them.
@@ -41,16 +40,15 @@ type Store interface {
 	GetDel(ctx context.Context, key string) (string, error)
 }
 
-// Sink applies an aggregated delta to the durable store (ES).
+// Sink applies an aggregated delta to the durable store.
 type Sink interface {
-	IncrementFieldInES(index string, id string, field string, value int) error
+	Add(ctx context.Context, id, field string, delta int64) error
 }
 
 // Counter aggregates increments for one index.
 type Counter struct {
 	Store Store
 	Sink  Sink
-	Index string // ES index of the counted documents
 	// Prefix namespaces the Redis keys (default "cnt").
 	Prefix string
 }
@@ -79,7 +77,7 @@ func split(m string) (id, field string, ok bool) {
 	return "", "", false
 }
 
-// Incr records n increments of field on document id. It never touches ES.
+// Incr records n increments of field on document id. It never touches the database.
 func (c *Counter) Incr(ctx context.Context, id, field string, n int64) error {
 	if _, err := c.Store.IncrBy(ctx, c.deltaKey(id, field), n); err != nil {
 		return fmt.Errorf("%w: %v", ErrNotRecorded, err)
@@ -95,7 +93,7 @@ func (c *Counter) Incr(ctx context.Context, id, field string, n int64) error {
 	return nil
 }
 
-// Flush applies up to max pending deltas to ES and returns how many documents were written.
+// Flush applies up to max pending deltas to the Sink and returns how many rows were written.
 func (c *Counter) Flush(ctx context.Context, max int64) (int, error) {
 	dirty, err := c.Store.SPopN(ctx, c.dirtyKey(), max)
 	if err != nil {
@@ -126,10 +124,10 @@ func (c *Counter) Flush(ctx context.Context, max int64) (int, error) {
 		if err != nil || delta == 0 {
 			continue
 		}
-		if err := c.Sink.IncrementFieldInES(c.Index, id, field, int(delta)); err != nil {
+		if err := c.Sink.Add(ctx, id, field, delta); err != nil {
 			// Put the delta back so the next flush retries it.
 			if rerr := c.Incr(ctx, id, field, delta); rerr != nil && firstErr == nil {
-				firstErr = fmt.Errorf("counter: lost %d on %s/%s: es=%v redis=%v", delta, id, field, err, rerr)
+				firstErr = fmt.Errorf("counter: lost %d on %s/%s: db=%v redis=%v", delta, id, field, err, rerr)
 			}
 			if firstErr == nil {
 				firstErr = err

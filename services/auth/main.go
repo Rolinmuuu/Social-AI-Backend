@@ -1,13 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"socialai/services/auth/handler"
-	sharedBackend "socialai/shared/backend"
 	"socialai/shared/constants"
+	"socialai/shared/db"
 	"socialai/shared/logger"
 
 	"go.uber.org/zap"
@@ -22,14 +24,15 @@ func main() {
 		log.Fatal("JWT_SECRET environment variable is required")
 	}
 
-	esBackend, err := sharedBackend.InitElasticsearchBackend()
+	pool, err := db.Open(context.Background(), constants.DATABASE_URL, 60*time.Second)
 	if err != nil {
-		log.Fatalf("Failed to initialize Elasticsearch: %v", err)
+		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
 	}
+	defer pool.Close()
 
 	addr := ":8081"
 	logger.Logger.Info("auth-service starting", zap.String("addr", addr))
-	if err := http.ListenAndServe(addr, handler.InitRouter(esBackend, jwtSecret)); err != nil {
+	if err := http.ListenAndServe(addr, handler.InitRouter(pool, jwtSecret)); err != nil {
 		logger.Logger.Fatal("auth-service stopped", zap.Error(err))
 	}
 }

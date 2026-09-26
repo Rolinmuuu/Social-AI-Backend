@@ -4,17 +4,17 @@ import (
 	"net/http"
 
 	"socialai/services/auth/service"
-	sharedBackend "socialai/shared/backend"
 	"socialai/shared/middleware"
 
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // InitRouter wires up the auth service routes with dependency injection.
-func InitRouter(esBackend sharedBackend.ElasticsearchBackendInterface, jwtSecret []byte) http.Handler {
-	userSvc := service.NewUserService(esBackend)
+func InitRouter(pool *pgxpool.Pool, jwtSecret []byte) http.Handler {
+	userSvc := service.NewUserService(pool)
 	h := NewAuthHandler(userSvc, jwtSecret)
 
 	router := mux.NewRouter()

@@ -25,6 +25,23 @@ var (
 		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 300},
 	}, []string{"topic"})
 
+	outboxPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "outbox_pending",
+		Help: "Events in the outbox table not yet published.",
+	})
+	outboxDead = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "outbox_dead",
+		Help: "Events parked after exhausting their attempts (only if MaxAttempts is set).",
+	})
+	outboxOldest = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "outbox_oldest_pending_seconds",
+		Help: "Age of the oldest unpublished event; grows during a broker outage.",
+	})
+	countersRepaired = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "post_counters_repaired_total",
+		Help: "Posts whose like/share count the reconciler rewrote from the source rows.",
+	})
+
 	consumed = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "consumer_handle_seconds",
 		Help:    "Time to handle one event, including retries.",
@@ -52,6 +69,16 @@ func (Outbox) Failed(topic string, dead bool) {
 	outboxFailed.WithLabelValues(topic, d).Inc()
 }
 func (Outbox) Lag(topic string, seconds float64) { outboxLag.WithLabelValues(topic).Observe(seconds) }
+
+// OutboxBacklog records the outbox table's backlog (see outbox.PGStore.Backlog).
+func OutboxBacklog(pending, dead int64, oldest time.Duration) {
+	outboxPending.Set(float64(pending))
+	outboxDead.Set(float64(dead))
+	outboxOldest.Set(oldest.Seconds())
+}
+
+// CountersRepaired counts posts fixed by the like/share count reconciler.
+func CountersRepaired(n int) { countersRepaired.Add(float64(n)) }
 
 // Consumer implements consumer.Metrics.
 type Consumer struct{}

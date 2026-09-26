@@ -2,44 +2,23 @@ package model
 
 import "time"
 
+// Post is the API representation of a post (the row lives in the posts table).
 type Post struct {
-	PostId        string    `json:"post_id"`
-	UserId        string    `json:"user_id"`
-	User          string    `json:"user"`
-	Message       string    `json:"message"`
-	Url           string    `json:"url"`
-	Type          string    `json:"type"`
-	Deleted       bool      `json:"deleted"`
-	DeletedAt     int64     `json:"deleted_at"`
-	CleanupStatus string    `json:"cleanup_status"`
-	RetryCount    int       `json:"retry_count"`
-	LastError     string    `json:"last_error"`
-	LikeCount     int       `json:"like_count"`
-	SharedCount   int       `json:"shared_count"`
-	Embedding     []float32 `json:"embedding,omitempty"`
-	CreatedAt     int64     `json:"created_at"`
-
-	// Transactional outbox: the post.created event is stored in the same document write as
-	// the post, and a relay publishes it (see shared/outbox). Not exposed to clients.
-	OutboxStatus   string `json:"outbox_status,omitempty"` // "pending" | "published" | "dead"
-	OutboxAttempts int    `json:"outbox_attempts,omitempty"`
-	OutboxNextAt   int64  `json:"outbox_next_at,omitempty"`
-	OutboxError    string `json:"outbox_error,omitempty"`
+	PostId      string `json:"post_id"`
+	UserId      string `json:"user_id"`
+	User        string `json:"user"`
+	Message     string `json:"message"`
+	Url         string `json:"url"`
+	Type        string `json:"type"`
+	Deleted     bool   `json:"deleted"`
+	DeletedAt   int64  `json:"deleted_at"`
+	LikeCount   int64  `json:"like_count"`
+	SharedCount int64  `json:"shared_count"`
+	CreatedAt   int64  `json:"created_at"` // unix seconds
 }
 
-// Outbox states.
-const (
-	OutboxPending   = "pending"
-	OutboxPublished = "published"
-	OutboxDead      = "dead"
-)
-
-// Public returns the post without internal bookkeeping fields, for API responses.
-func (p Post) Public() Post {
-	p.OutboxStatus, p.OutboxAttempts, p.OutboxNextAt, p.OutboxError = "", 0, 0, ""
-	p.Embedding = nil
-	return p
-}
+// Public returns the post as clients see it.
+func (p Post) Public() Post { return p }
 
 type User struct {
 	UserId   string `json:"user_id"`
@@ -84,12 +63,16 @@ type Follow struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// Message is one direct message. Seq orders messages within their conversation (gap-free,
+// in commit order); MessageId is "<conversation_id>:<seq>".
 type Message struct {
-	MessageId  string    `json:"message_id"`
-	SenderId   string    `json:"sender_id"`
-	ReceiverId string    `json:"receiver_id"`
-	Content    string    `json:"content"`
-	CreatedAt  time.Time `json:"created_at"`
+	MessageId      string    `json:"message_id"`
+	ConversationId string    `json:"conversation_id"`
+	Seq            int64     `json:"seq"`
+	SenderId       string    `json:"sender_id"`
+	ReceiverId     string    `json:"receiver_id"`
+	Content        string    `json:"content"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type Notification struct {

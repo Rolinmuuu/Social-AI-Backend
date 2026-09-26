@@ -7,3 +7,6 @@ var (
 	ErrAlreadyFollowing = errors.New("already following this user")
 	ErrNotFollowing     = errors.New("not following this user")
 )
+
+// ErrUserNotFound: the account to follow does not exist.
+var ErrUserNotFound = errors.New("user not found")

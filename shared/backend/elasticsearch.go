@@ -4,142 +4,71 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"socialai/shared/constants"
 
 	"github.com/olivere/elastic/v7"
 )
 
-var ESBackend ElasticsearchBackendInterface
+// PostSearchMapping is the mapping of the post search index. The index holds only what
+// search needs; everything shown to a client is read from PostgreSQL.
+//
+// A mapping change means a new physical index: create posts_vN+1 with the new mapping, fill
+// it from PostgreSQL (cmd/reindex -new-index), then move the "posts" alias in one atomic
+// call. Readers and the indexer only ever use the alias.
+const PostSearchMapping = `{
+	"mappings": {
+		"dynamic": "strict",
+		"properties": {
+			"post_id":    { "type": "keyword" },
+			"user_id":    { "type": "keyword" },
+			"message":    { "type": "text" },
+			"type":       { "type": "keyword" },
+			"created_at": { "type": "long" },
+			"deleted":    { "type": "boolean" },
+			"embedding":  { "type": "dense_vector", "dims": 1536, "index": true, "similarity": "cosine" }
+		}
+	}
+}`
 
 type ElasticsearchBackend struct {
 	client *elastic.Client
 }
 
-func InitElasticsearchBackend() (ElasticsearchBackendInterface, error) {
+// InitElasticsearchBackend connects and makes sure the post search index and its alias
+// exist. It no longer creates the legacy per-entity indices (user, follow, like, ...): that
+// data lives in PostgreSQL. cmd/backfill still reads them once, during migration.
+func InitElasticsearchBackend() (*ElasticsearchBackend, error) {
 	client, err := elastic.NewClient(
 		elastic.SetURL(constants.ES_URL),
 		elastic.SetBasicAuth(constants.ES_USERNAME, constants.ES_PASSWORD),
+		elastic.SetSniff(false),
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	indices := map[string]string{
-		constants.POST_INDEX: `{
-			"mappings": { "properties": {
-				"post_id":       { "type": "keyword" },
-				"user_id":       { "type": "keyword" },
-				"user":          { "type": "keyword" },
-				"message":       { "type": "text" },
-				"url":           { "type": "keyword", "index": false },
-				"type":          { "type": "keyword", "index": false },
-				"deleted":       { "type": "boolean" },
-				"deleted_at":    { "type": "long" },
-				"cleanup_status":{ "type": "keyword" },
-				"retry_count":   { "type": "integer" },
-				"last_error":    { "type": "text" },
-				"like_count":    { "type": "integer" },
-				"shared_count":  { "type": "integer" },
-				"embedding":     { "type": "dense_vector", "dims": 1536, "index": true, "similarity": "cosine" },
-				"created_at":    { "type": "long" },
-				"outbox_status": { "type": "keyword" },
-				"outbox_attempts": { "type": "integer" },
-				"outbox_next_at":  { "type": "long" },
-				"outbox_error":    { "type": "text", "index": false }
-			}}}`,
-		constants.USER_INDEX: `{
-			"mappings": { "properties": {
-				"user_id":  { "type": "keyword" },
-				"username": { "type": "keyword" },
-				"password": { "type": "keyword" },
-				"age":      { "type": "long", "index": false },
-				"gender":   { "type": "keyword", "index": false }
-			}}}`,
-		constants.FOLLOW_INDEX: `{
-			"mappings": { "properties": {
-				"follow_id":   { "type": "keyword" },
-				"follower_id": { "type": "keyword" },
-				"followee_id": { "type": "keyword" },
-				"created_at":  { "type": "date" }
-			}}}`,
-		constants.MESSAGE_INDEX: `{
-			"mappings": { "properties": {
-				"message_id":  { "type": "keyword" },
-				"sender_id":   { "type": "keyword" },
-				"receiver_id": { "type": "keyword" },
-				"content":     { "type": "text" },
-				"created_at":  { "type": "date" }
-			}}}`,
-		constants.LIKE_INDEX: `{
-			"mappings": { "properties": {
-				"post_like_id": { "type": "keyword" },
-				"user_id":      { "type": "keyword" },
-				"post_id":      { "type": "keyword" },
-				"created_at":   { "type": "long" }
-			}}}`,
-		constants.SHARE_INDEX: `{
-			"mappings": { "properties": {
-				"post_share_id": { "type": "keyword" },
-				"user_id":       { "type": "keyword" },
-				"post_id":       { "type": "keyword" },
-				"created_at":    { "type": "long" },
-				"platform":      { "type": "keyword" }
-			}}}`,
-		constants.COMMENT_INDEX: `{
-			"mappings": { "properties": {
-				"comment_id":        { "type": "keyword" },
-				"parent_comment_id": { "type": "keyword" },
-				"root_comment_id":   { "type": "keyword" },
-				"user_id":           { "type": "keyword" },
-				"post_id":           { "type": "keyword" },
-				"depth":             { "type": "integer" },
-				"content":           { "type": "text" },
-				"created_at":        { "type": "long" },
-				"deleted":           { "type": "boolean" },
-				"deleted_at":        { "type": "long" }
-			}}}`,
-		constants.NOTIFICATION_INDEX: `{
-			"mappings": { "properties": {
-				"notification_id": { "type": "keyword" },
-				"user_id":         { "type": "keyword" },
-				"type":            { "type": "keyword" },
-				"actor_id":        { "type": "keyword" },
-				"post_id":         { "type": "keyword" },
-				"read":            { "type": "boolean" },
-				"created_at":      { "type": "long" }
-			}}}`,
-	}
-
+	b := &ElasticsearchBackend{client: client}
 	ctx := context.Background()
-	for index, mapping := range indices {
-		exists, err := client.IndexExists(index).Do(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to check index %s: %v", index, err)
+	exists, err := client.IndexExists(constants.SEARCH_POST_ALIAS).Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("check alias %s: %w", constants.SEARCH_POST_ALIAS, err)
+	}
+	if !exists {
+		if err := b.CreateIndex(ctx, constants.SEARCH_POST_INDEX, PostSearchMapping); err != nil {
+			return nil, err
 		}
-		if !exists {
-			if _, err := client.CreateIndex(index).Body(mapping).Do(ctx); err != nil {
-				return nil, fmt.Errorf("failed to create index %s: %v", index, err)
-			}
+		if err := b.PointAlias(ctx, constants.SEARCH_POST_ALIAS, constants.SEARCH_POST_INDEX); err != nil {
+			return nil, err
 		}
 	}
-
-	fmt.Println("All Elasticsearch indices are ready.")
-	return &ElasticsearchBackend{client: client}, nil
+	return b, nil
 }
 
 // withoutVectors keeps the 1536-float embedding out of search responses: it is only needed
-// inside Elasticsearch for kNN, and shipping it back added roughly 15-20 KB of JSON per post.
+// inside Elasticsearch for kNN, and shipping it back added roughly 15-20 KB of JSON per hit.
 func withoutVectors() *elastic.FetchSourceContext {
 	return elastic.NewFetchSourceContext(true).Exclude("embedding")
-}
-
-func (b *ElasticsearchBackend) ReadFromES(query elastic.Query, index string) (*elastic.SearchResult, error) {
-	return b.client.Search().
-		Index(index).
-		Query(query).
-		FetchSourceContext(withoutVectors()).
-		Do(context.Background())
 }
 
 func (b *ElasticsearchBackend) ReadFromESWithSize(query elastic.Query, index string, size int) (*elastic.SearchResult, error) {
@@ -151,110 +80,98 @@ func (b *ElasticsearchBackend) ReadFromESWithSize(query elastic.Query, index str
 		Do(context.Background())
 }
 
-// SearchSorted returns up to size hits ordered by sortField, ties broken by post_id in the
-// same direction so the order is total (paging by (sortField, post_id) depends on that).
-// UnmappedType lets the sort run on an older index where the field does not exist yet.
-func (b *ElasticsearchBackend) SearchSorted(query elastic.Query, index, sortField string, ascending bool, size int) (*elastic.SearchResult, error) {
-	return b.client.Search().
-		Index(index).
-		Query(query).
-		SortBy(
-			elastic.NewFieldSort(sortField).Order(ascending).UnmappedType("long"),
-			elastic.NewFieldSort("post_id").Order(ascending).UnmappedType("keyword"),
-		).
-		Size(size).
-		FetchSourceContext(withoutVectors()).
-		Do(context.Background())
+// KNNSearchFromES runs an approximate nearest-neighbour search (top-level "knn" section of
+// the search API) restricted by filter.
+func (b *ElasticsearchBackend) KNNSearchFromES(index, field string, vector []float32, k int, filter elastic.Query) (*elastic.SearchResult, error) {
+	knn := map[string]interface{}{
+		"field":          field,
+		"query_vector":   vector,
+		"k":              k,
+		"num_candidates": k * 10,
+	}
+	if filter != nil {
+		src, err := filter.Source()
+		if err != nil {
+			return nil, err
+		}
+		knn["filter"] = src
+	}
+	body := map[string]interface{}{
+		"knn":     knn,
+		"size":    k,
+		"_source": map[string]interface{}{"excludes": []string{"embedding"}},
+	}
+	return b.client.Search().Index(index).Source(body).Do(context.Background())
 }
 
-// CreateInES indexes the document only if the id does not exist yet (op_type=create).
-// created=false with a nil error means the document already existed. This makes the
-// like document the atomic, durable "has this user liked this post" check.
-func (b *ElasticsearchBackend) CreateInES(i interface{}, index string, id string) (bool, error) {
+// IndexVersioned writes doc under id with version_type=external. Elasticsearch keeps the
+// document only if version is higher than the one it has, so replays, duplicates and
+// out-of-order events can never move the index backwards. applied=false with a nil error
+// means the index already had this version or a newer one (not an error for the caller).
+func (b *ElasticsearchBackend) IndexVersioned(index, id string, doc interface{}, version int64) (bool, error) {
 	_, err := b.client.Index().
 		Index(index).
 		Id(id).
-		OpType("create").
-		BodyJson(i).
+		VersionType("external").
+		Version(version).
+		BodyJson(doc).
 		Do(context.Background())
+	if elastic.IsConflict(err) {
+		return false, nil
+	}
 	if err != nil {
-		if elastic.IsConflict(err) {
-			return false, nil
-		}
 		return false, err
 	}
 	return true, nil
 }
 
-// UpdateFieldsInES merges fields into an existing document (partial update). Unlike a full
-// SaveToES of a document read earlier, it cannot overwrite counters that changed meanwhile.
-func (b *ElasticsearchBackend) UpdateFieldsInES(index string, id string, fields map[string]interface{}) error {
-	_, err := b.client.Update().
-		Index(index).
-		Id(id).
-		Doc(fields).
-		RetryOnConflict(3).
-		Do(context.Background())
-	return err
-}
-
-func (b *ElasticsearchBackend) SaveToES(i interface{}, index string, id string) error {
-	_, err := b.client.Index().
-		Index(index).
-		Id(id).
-		BodyJson(i).
-		Do(context.Background())
-	return err
-}
-
-func (b *ElasticsearchBackend) DeleteFromES(index string, id string) (bool, error) {
-	resp, err := b.client.Delete().
-		Index(index).
-		Id(id).
-		Do(context.Background())
-	if err != nil {
-		return false, err
+// Scan calls fn with the id and source of every document in index (scroll API).
+func (b *ElasticsearchBackend) Scan(ctx context.Context, index string, fn func(id string, source json.RawMessage) error) error {
+	scroll := b.client.Scroll(index).Size(500).FetchSourceContext(elastic.NewFetchSourceContext(true))
+	defer scroll.Clear(context.Background())
+	for {
+		res, err := scroll.Do(ctx)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			if elastic.IsNotFound(err) {
+				return nil // index does not exist: nothing to scan
+			}
+			return err
+		}
+		for _, hit := range res.Hits.Hits {
+			if err := fn(hit.Id, hit.Source); err != nil {
+				return err
+			}
+		}
 	}
-	return resp.Result == "deleted", nil
 }
 
-func (b *ElasticsearchBackend) IncrementFieldInES(index, id, field string, value int) error {
-	scriptSource := "ctx._source[params.field] = (ctx._source[params.field] == null ? 0 : ctx._source[params.field]) + params.value"
-	script := elastic.NewScript(scriptSource).Params(map[string]interface{}{"field": field, "value": value})
-	result, err := b.client.Update().
-		Index(index).
-		Id(id).
-		Script(script).
-		RetryOnConflict(3).
-		Do(context.Background())
-	if err != nil {
-		return err
-	}
-	if result.Result != "updated" && result.Result != "noop" {
-		return fmt.Errorf("increment failed: result=%s", result.Result)
+// CreateIndex creates index with the given settings/mappings body.
+func (b *ElasticsearchBackend) CreateIndex(ctx context.Context, index, body string) error {
+	if _, err := b.client.CreateIndex(index).Body(body).Do(ctx); err != nil {
+		return fmt.Errorf("create index %s: %w", index, err)
 	}
 	return nil
 }
 
-func (b *ElasticsearchBackend) KNNSearchFromES(index, field string, vector []float32, k int) (*elastic.SearchResult, error) {
-	query := map[string]interface{}{
-		"knnQuery": map[string]interface{}{
-			"field":          field,
-			"vector":         vector,
-			"k":              k,
-			"num_candidates": k * 2,
-		},
+// PointAlias makes alias point at index only, removing it from any other index in the same
+// atomic request, so readers switch from the old index to the new one at once.
+func (b *ElasticsearchBackend) PointAlias(ctx context.Context, alias, index string) error {
+	svc := b.client.Alias().Add(index, alias)
+	current, err := b.client.Aliases().Alias(alias).Do(ctx)
+	if err == nil {
+		for _, old := range current.IndicesByAlias(alias) {
+			if old != index {
+				svc = svc.Remove(old, alias)
+			}
+		}
+	} else if !elastic.IsNotFound(err) {
+		return err
 	}
-	jsonQuery, err := json.Marshal(query)
-	if err != nil {
-		return nil, err
+	if _, err := svc.Do(ctx); err != nil {
+		return fmt.Errorf("point alias %s at %s: %w", alias, index, err)
 	}
-	searchResult, err := b.client.Search().
-		Index(index).
-		Source(string(jsonQuery)).
-		Do(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	return searchResult, nil
+	return nil
 }

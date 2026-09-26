@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -133,8 +132,10 @@ func (h *PostHandler) uploadPostHandler(w http.ResponseWriter, r *http.Request) 
 
 	fp := idempotency.Fingerprint(p.Message, header.Filename, strconv.FormatInt(header.Size, 10))
 	h.withIdempotency(w, r, "upload", userId, fp, func() (int, interface{}) {
-		if err := h.postSvc.SavePost(&p, file); err != nil {
-			fmt.Printf("upload error: %v\n", err)
+		// Detached from the connection, like the idempotency bookkeeping: a client that gives
+		// up mid-upload must not roll back a post whose retry will be answered from the store.
+		if err := h.postSvc.SavePost(context.WithoutCancel(r.Context()), &p, file); err != nil {
+			log.Printf("upload error: %v", err)
 			return http.StatusInternalServerError, map[string]string{"error": "failed to save post"}
 		}
 		return http.StatusCreated, map[string]string{"post_id": p.PostId}
@@ -155,6 +156,7 @@ func (h *PostHandler) homeFeedHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		log.Printf("feed error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load feed"})
 		return
 	}
@@ -171,19 +173,20 @@ func (h *PostHandler) searchPostHandler(w http.ResponseWriter, r *http.Request) 
 	var posts []model.Post
 	var err error
 	if userId != "" {
-		posts, err = h.postSvc.SearchPostByUserId(userId)
+		posts, err = h.postSvc.SearchPostByUserId(r.Context(), userId)
 	} else if mode == "semantic" && keywords != "" {
 		posts, err = h.postSvc.SemanticSearch(r.Context(), keywords, 20)
 	} else {
-		posts, err = h.postSvc.SearchPostByKeywords(keywords)
+		posts, err = h.postSvc.SearchPostByKeywords(r.Context(), keywords)
 	}
 	if err != nil {
+		log.Printf("search error: %v", err)
 		http.Error(w, `{"error":"failed to search posts"}`, http.StatusInternalServerError)
 		return
 	}
-	public := make([]model.Post, len(posts))
-	for i, p := range posts {
-		public[i] = p.Public()
+	public := make([]model.Post, 0, len(posts))
+	for _, p := range posts {
+		public = append(public, p.Public())
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"posts": public})
@@ -204,7 +207,7 @@ func (h *PostHandler) deletePostHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	deleted, err := h.postSvc.DeletePost(postId, userId)
+	deleted, err := h.postSvc.DeletePost(r.Context(), postId, userId)
 	if err != nil {
 		if errors.Is(err, service.ErrPostNotFound) {
 			http.Error(w, `{"error":"post not found"}`, http.StatusNotFound)
@@ -235,7 +238,7 @@ func (h *PostHandler) likePostHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	liked, err := h.postSvc.LikePost(postId, userId)
+	liked, err := h.postSvc.LikePost(r.Context(), postId, userId)
 	if err != nil {
 		if errors.Is(err, service.ErrAlreadyLiked) {
 			http.Error(w, `{"error":"post already liked"}`, http.StatusConflict)
@@ -273,7 +276,7 @@ func (h *PostHandler) sharePostHandler(w http.ResponseWriter, r *http.Request) {
 		req.Platform = "external"
 	}
 
-	shared, err := h.postSvc.SharePost(postId, userId, req.Platform)
+	shared, err := h.postSvc.SharePost(r.Context(), postId, userId, req.Platform)
 	if err != nil {
 		if errors.Is(err, service.ErrPostNotFound) {
 			http.Error(w, `{"error":"post not found"}`, http.StatusNotFound)
@@ -309,13 +312,19 @@ func (h *PostHandler) addCommentToPostHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	commentId, err := h.postSvc.AddComment(postId, req.ParentCommentId, userId, req.Content)
+	commentId, err := h.postSvc.AddComment(r.Context(), postId, req.ParentCommentId, userId, req.Content)
 	if err != nil {
-		if errors.Is(err, service.ErrPostNotFound) {
+		switch {
+		case errors.Is(err, service.ErrInvalidComment):
+			http.Error(w, `{"error":"comment must be 1-2000 characters"}`, http.StatusBadRequest)
+		case errors.Is(err, service.ErrPostNotFound):
 			http.Error(w, `{"error":"post not found"}`, http.StatusNotFound)
-			return
+		case errors.Is(err, service.ErrCommentNotFound):
+			http.Error(w, `{"error":"parent comment not found on this post"}`, http.StatusNotFound)
+		default:
+			log.Printf("comment error: %v", err)
+			http.Error(w, `{"error":"failed to add comment"}`, http.StatusInternalServerError)
 		}
-		http.Error(w, `{"error":"failed to add comment"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -349,4 +358,43 @@ func (h *PostHandler) generateImageFromOpenAIHandler(w http.ResponseWriter, r *h
 		}
 		return http.StatusCreated, post.Public()
 	})
+}
+
+// DELETE /post/{id}/like — remove the caller's like.
+func (h *PostHandler) unlikePostHandler(w http.ResponseWriter, r *http.Request) {
+	userId, err := utils.GetUserIdFromJwtToken(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	switch err := h.postSvc.UnlikePost(r.Context(), mux.Vars(r)["id"], userId); {
+	case errors.Is(err, service.ErrNotLiked):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "post not liked"})
+	case err != nil:
+		log.Printf("unlike error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to unlike post"})
+	default:
+		writeJSON(w, http.StatusOK, map[string]string{"message": "like removed"})
+	}
+}
+
+// GET /post/{id}/comments?limit=&cursor= — comments on a post, oldest first.
+func (h *PostHandler) listCommentsHandler(w http.ResponseWriter, r *http.Request) {
+	if _, err := utils.GetUserIdFromJwtToken(r); err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	page, err := h.postSvc.ListComments(r.Context(), mux.Vars(r)["id"], limit, r.URL.Query().Get("cursor"))
+	switch {
+	case errors.Is(err, service.ErrBadCursor):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+	case errors.Is(err, service.ErrPostNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "post not found"})
+	case err != nil:
+		log.Printf("list comments error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load comments"})
+	default:
+		writeJSON(w, http.StatusOK, page)
+	}
 }

@@ -45,7 +45,9 @@ func InitRouter(
 	router.Handle("/post/{id}", jwtAuth.Handler(http.HandlerFunc(h.deletePostHandler))).Methods("DELETE")
 	router.Handle("/post/{id}/like", jwtAuth.Handler(http.HandlerFunc(h.likePostHandler))).Methods("POST")
 	router.Handle("/post/{id}/share", jwtAuth.Handler(http.HandlerFunc(h.sharePostHandler))).Methods("POST")
+	router.Handle("/post/{id}/like", jwtAuth.Handler(http.HandlerFunc(h.unlikePostHandler))).Methods("DELETE")
 	router.Handle("/post/{id}/comment", jwtAuth.Handler(http.HandlerFunc(h.addCommentToPostHandler))).Methods("POST")
+	router.Handle("/post/{id}/comments", jwtAuth.Handler(http.HandlerFunc(h.listCommentsHandler))).Methods("GET")
 	router.Handle("/post/generate-image-from-openai", jwtAuth.Handler(http.HandlerFunc(h.generateImageFromOpenAIHandler))).Methods("POST")
 
 	origins := handlers.AllowedOrigins([]string{"*"})

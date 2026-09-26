@@ -40,7 +40,7 @@ func (h *AuthHandler) signupHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.userSvc.AddUser(&user); err != nil {
+	if err := h.userSvc.AddUser(r.Context(), &user); err != nil {
 		if errors.Is(err, service.ErrUserAlreadyExisted) {
 			http.Error(w, `{"error":"user already exists"}`, http.StatusConflict)
 			return
@@ -68,7 +68,7 @@ func (h *AuthHandler) signinHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.userSvc.CheckUser(user.UserId, user.Password); err != nil {
+	if err := h.userSvc.CheckUser(r.Context(), user.UserId, user.Password); err != nil {
 		if errors.Is(err, service.ErrInvalidCredentials) {
 			// Return 401 with a generic message — do not distinguish "user not found" vs "wrong password"
 			http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
