@@ -144,6 +144,7 @@ jobs:
       # Any non-empty key starts post-service; the indexer's embedding calls then fail and it
       # indexes without vectors (keyword search), which is the documented degraded mode.
       OPENAI_API_KEY: e2e-not-a-real-key
+      ES_PASSWORD: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -188,8 +189,20 @@ jobs:
             echo
             docker compose ps -a --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
             echo '```'
-            for s in $(docker compose config --services); do
-              case "$s" in grafana|kibana|prometheus|elasticsearch-logs|logstash|zookeeper) continue;; esac
+            echo '#### Outbox'
+            echo '```'
+            docker compose exec -T postgres psql -U socialai -d socialai -c "SELECT id, topic, status, attempts, left(last_error, 150) AS last_error FROM outbox ORDER BY id" 2>&1 | head -40
+            echo '```'
+            echo '#### Kafka topics and consumer groups'
+            echo '```'
+            docker compose exec -T kafka kafka-topics --bootstrap-server kafka:9092 --list 2>&1 | head -30
+            docker compose exec -T kafka kafka-consumer-groups --bootstrap-server kafka:9092 --describe --all-groups 2>&1 | head -40
+            echo '```'
+            echo '#### Redis keys'
+            echo '```'
+            docker compose exec -T redis redis-cli --scan 2>&1 | head -40
+            echo '```'
+            for s in post feed-worker search-indexer notification-worker nginx auth social message migrate gcs kafka elasticsearch; do
               echo "<details><summary>$s</summary>"
               echo
               echo '```'
